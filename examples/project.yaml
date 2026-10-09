@@ -1,0 +1,47 @@
+# Example project profile for the Engineering Workflow Mod (ewm).
+#
+# Save it as .ewm/project.yaml in the workspace. examples/project.json holds the
+# same profile as JSON. Keys you leave out keep their defaults, shown in the
+# comments. A wrong type falls back to the default with a warning; an unknown key
+# is ignored with a warning. Edits apply on the next /ewm new or /ewm resume.
+#
+# This profile describes a small TypeScript HTTP service in one repository.
+
+profile_id: orders-api          # short id stored on every task (default: default)
+name: Orders API                # display name (default: Default)
+
+repositories: ["."]             # repository roots, relative to the workspace (default: ["."])
+domains: [orders, payments]     # business areas this project covers (default: [])
+entrypoints:                    # where exploration starts (default: README.md, docs/)
+  - README.md
+  - docs/
+  - src/server.ts
+
+policies:
+  # deny_by_default blocks web access, outbound tools, third-party MCP tools and
+  # network commands (curl, git fetch, ...) while a task is active. "allow" lifts that.
+  external_network: deny_by_default
+  # true: moving from PLAN to IMPLEMENT needs your approval (/ewm approve).
+  require_plan_approval: true
+  # true: repository writes are allowed during EXPLORE (default: false).
+  allow_write_in_explore: false
+  # Third-party MCP tools allowed while a task is active: exact names, or a prefix
+  # ending in "*". These two are read-only GitHub tools (default: empty list).
+  allowed_mcp_tools:
+    - mcp__github__issue_read
+    - mcp__github__pull_request_read
+
+models:
+  lead: opus                    # lead role; recorded, not routed in v0.0.0
+  search: haiku                 # ewm:repo-scout and ewm:docs-scout
+  reviewer: sonnet              # ewm:reviewer
+
+budgets:
+  max_parallel_researchers: 3                   # research agents running at once
+  max_research_rounds_without_user_update: 2    # rounds before the model reports back to you
+  max_findings_per_scout: 8                     # findings one scout may return per delegation
+
+validation:
+  # Commands the mod may run through mcp__ewm__run_validation. Run without a shell.
+  commands: ["npm test", "npm run lint"]
+  timeout_ms: 300000            # time limit for each command, in milliseconds

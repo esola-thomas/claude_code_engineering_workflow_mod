@@ -1,0 +1,389 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/esola-thomas/claude_code_engineering_workflow_mod/schemas/task.schema.json",
+  "title": "ewm task",
+  "description": "Durable state of one ewm task, stored at .ewm/tasks/TASK-NNN/task.json. Mirrors the Task type in src/types.ts. The gate ledger (approvals and validation runs that count for gates) is kept in the mod's store and is not part of this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "project_profile",
+    "title",
+    "goal",
+    "phase",
+    "paused_from",
+    "mode",
+    "repo",
+    "success_criteria",
+    "constraints",
+    "artifacts",
+    "findings",
+    "open_questions",
+    "decisions",
+    "approvals",
+    "transitions",
+    "agent_usage",
+    "validations",
+    "plan",
+    "system_map",
+    "usage_by_phase",
+    "next_action",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^TASK-\\d{3,}$",
+      "description": "Task id, TASK-NNN. Validated before it is used in any path."
+    },
+    "project_profile": {
+      "type": "string",
+      "description": "profile_id of the profile the task was created under."
+    },
+    "title": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "phase": {
+      "$ref": "#/$defs/Phase"
+    },
+    "paused_from": {
+      "anyOf": [{ "$ref": "#/$defs/ActivePhase" }, { "type": "null" }],
+      "description": "Set while PAUSED: the phase to return to on resume. Null otherwise."
+    },
+    "mode": {
+      "$ref": "#/$defs/Mode"
+    },
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "branch", "base_commit"],
+      "properties": {
+        "root": { "type": "string" },
+        "branch": { "type": ["string", "null"] },
+        "base_commit": { "type": ["string", "null"] }
+      }
+    },
+    "success_criteria": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ArtifactName" },
+      "description": "Artifact file names present in the task directory."
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Finding" }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Question" }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Decision" }
+    },
+    "approvals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Approval" }
+    },
+    "transitions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Transition" }
+    },
+    "agent_usage": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/AgentUse" }
+    },
+    "validations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ValidationRun" }
+    },
+    "plan": {
+      "anyOf": [{ "$ref": "#/$defs/Plan" }, { "type": "null" }]
+    },
+    "system_map": {
+      "anyOf": [{ "$ref": "#/$defs/SystemMap" }, { "type": "null" }],
+      "description": "Written only by the write_map tool; rendered to system-map.md."
+    },
+    "usage_by_phase": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Phase" },
+      "additionalProperties": { "$ref": "#/$defs/PhaseUsage" }
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "Phase": {
+      "enum": ["INTAKE", "EXPLORE", "UNDERSTAND", "PLAN", "IMPLEMENT", "VALIDATE", "DONE", "PAUSED"]
+    },
+    "ActivePhase": {
+      "enum": ["INTAKE", "EXPLORE", "UNDERSTAND", "PLAN", "IMPLEMENT", "VALIDATE"]
+    },
+    "Mode": {
+      "enum": ["deep"]
+    },
+    "Confidence": {
+      "enum": ["high", "medium", "low"]
+    },
+    "Actor": {
+      "enum": ["user", "model", "system"]
+    },
+    "GateName": {
+      "enum": ["plan_approval", "done_acceptance"]
+    },
+    "ArtifactName": {
+      "enum": ["exploration.md", "system-map.md", "questions.md", "plan.md", "validation.md", "decisions.md", "handoff.md"]
+    },
+    "Evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Repo-relative path of a file or doc. Must exist when recorded."
+        },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 },
+        "doc_id": {
+          "type": "string",
+          "description": "Optional doc or section identifier (ADR number, spec section, heading)."
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "Finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "claim",
+        "evidence",
+        "confidence",
+        "open_questions",
+        "last_verified_commit",
+        "source",
+        "stale",
+        "recorded_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "description": "Finding id, for example F-001." },
+        "claim": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Evidence" }
+        },
+        "confidence": { "$ref": "#/$defs/Confidence" },
+        "open_questions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "last_verified_commit": { "type": ["string", "null"] },
+        "source": {
+          "type": "string",
+          "description": "Who produced the finding: 'lead' or an agent type such as 'ewm:repo-scout'."
+        },
+        "stale": { "type": "boolean" },
+        "recorded_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "status", "raised_at"],
+      "properties": {
+        "id": { "type": "string", "description": "Question id, for example Q-001." },
+        "text": { "type": "string" },
+        "status": { "enum": ["open", "resolved"] },
+        "answer": { "type": "string" },
+        "raised_at": { "type": "string", "format": "date-time" },
+        "resolved_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "choice", "rationale", "phase", "decided_by", "at"],
+      "properties": {
+        "id": { "type": "string", "description": "Decision id, for example D-001." },
+        "title": { "type": "string" },
+        "choice": { "type": "string" },
+        "rationale": { "type": "string" },
+        "phase": { "$ref": "#/$defs/Phase" },
+        "decided_by": { "$ref": "#/$defs/Actor" },
+        "at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate", "decision", "by", "via", "at"],
+      "properties": {
+        "gate": { "$ref": "#/$defs/GateName" },
+        "decision": { "enum": ["approved", "rejected"] },
+        "by": { "const": "user" },
+        "via": { "enum": ["command", "pane"] },
+        "at": { "type": "string", "format": "date-time" },
+        "note": { "type": "string" },
+        "plan_hash": {
+          "type": "string",
+          "description": "For plan_approval: the plan hash at approval time."
+        }
+      }
+    },
+    "Transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "actor", "reason", "at"],
+      "properties": {
+        "from": { "$ref": "#/$defs/Phase" },
+        "to": { "$ref": "#/$defs/Phase" },
+        "actor": { "$ref": "#/$defs/Actor" },
+        "reason": { "type": "string" },
+        "at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "AgentUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_type", "model", "phase", "rule", "at"],
+      "properties": {
+        "agent_type": { "type": "string" },
+        "model": {
+          "type": "string",
+          "description": "The model the engine resolved for the spawn, usually a full model id."
+        },
+        "routed_model": {
+          "type": "string",
+          "description": "The alias the router asked for (for example 'haiku'), when it routed the spawn."
+        },
+        "agent_id": { "type": "string" },
+        "description": { "type": "string" },
+        "phase": { "$ref": "#/$defs/Phase" },
+        "rule": {
+          "type": "string",
+          "description": "How the model was chosen, for example 'profile.models.search' or 'unrouted'."
+        },
+        "at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "PlanStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "files", "status"],
+      "properties": {
+        "id": { "type": "string", "description": "Step id, for example S-1." },
+        "text": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "enum": ["todo", "doing", "done", "skipped"] }
+      }
+    },
+    "Plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "steps", "risks", "tests", "alternatives", "hash", "updated_at"],
+      "properties": {
+        "summary": { "type": "string" },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PlanStep" }
+        },
+        "risks": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tests": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "alternatives": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "hash": {
+          "type": "string",
+          "description": "Stable hash of the plan content. Gate checks recompute it instead of trusting this value."
+        },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ValidationRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "command", "exit_code", "ok", "duration_ms", "output_tail", "commit", "at"],
+      "properties": {
+        "id": { "type": "string", "description": "Validation id, for example V-001." },
+        "command": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "ok": { "type": "boolean" },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "output_tail": {
+          "type": "string",
+          "description": "Last part of combined stdout and stderr, with secrets redacted."
+        },
+        "commit": { "type": ["string", "null"] },
+        "at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "SystemMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mermaid", "text_map", "components", "updated_at"],
+      "properties": {
+        "mermaid": { "type": "string" },
+        "text_map": { "type": "string" },
+        "components": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "PhaseUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens"
+      ],
+      "properties": {
+        "turns": { "type": "integer", "minimum": 0 },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_input_tokens": { "type": "integer", "minimum": 0 },
+        "cache_creation_input_tokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

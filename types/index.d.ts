@@ -28,6 +28,8 @@ declare module 'claude-code' {
       section: EwmPaneSection
       /** Notice line under the pane (last action result). */
       notice: string | null
+      /** The absolute workspace root pinned at session.start; lets a hot reload keep it. */
+      root: string | null
     }
   }
 }
