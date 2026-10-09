@@ -1,0 +1,8 @@
+node_modules/
+# Engine-generated declarations (written on hot reload; build-specific)
+.claude-plugin/types/
+# Local workflow state if the repo itself is used as an ewm workspace
+.ewm/tasks/
+.ewm/state.json
+*.log
+.DS_Store
