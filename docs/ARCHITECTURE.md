@@ -397,3 +397,25 @@ export function engineIo(source: EngineIoSource): Io
 - `agents/repo-scout.md` (model: haiku; tools: Read, Grep, Glob), `agents/docs-scout.md` (haiku; Read, Grep, Glob), `agents/reviewer.md` (sonnet; Read, Grep, Glob, Bash). Each returns at most N findings in the evidence format (claim, evidence path:line, confidence, open questions) and never edits.
 - `skills/{intake,explore,understand,plan,implement,validate}/SKILL.md`: the stage contract from SPEC §4, which `mcp__ewm__*` tools to use (load them with ToolSearch `select:mcp__ewm__status,mcp__ewm__advance,...` if they are not loaded), delegation rules (<= 3 concurrent scouts, bounded asks, structured outputs, dedupe, verify before recording; the Agent tool may run scouts in the background, wait for their results), gates (never implement before approval; ask the human to run `/ewm approve`), and the exit condition for the stage.
 - `schemas/project.schema.json`, `schemas/task.schema.json`: JSON Schema (draft 2020-12) mirroring `Profile` and `Task`.
+
+## Hardening amendments (Run 2)
+
+These amend the sections above; where they conflict, this section wins.
+
+| # | Amendment |
+|---|---|
+| CR5 | The ledger entry holds `phase` and `paused_from` and is their source of truth. Every transition, pause and resume writes both ledger and task.json; the guard, gates, `activeContext` and `resume` use the ledger values (`trustedTask` overrides `phase`/`paused_from` too). A model edit of task.json while PAUSED or in IMPLEMENT cannot change the phase the mod enforces or where a task resumes. |
+| CR6 | State-changing commands (`new`, `resume`, `pause`, `plan`, `approve`, `reject`) are accepted only from human origins (`composer`, `bridge`, `sdk`, or a pane press). `status`, `map`, `questions`, `list`, `help` work from any origin. |
+| CR7 | `nextTaskId` = max(task dirs, ledger task ids) + 1; creating a task replaces any stale ledger entry for its id. |
+| CR8 | `planHash` is SHA-256 (hex) over the canonical plan JSON, from a pure TypeScript implementation in `src/sha256.ts` tested against NIST vectors. |
+| CR9 | VALIDATE -> DONE needs >= 1 trusted validation with `ok: true` recorded after the latest transition into VALIDATE, plus the human acceptance. `pendingGate` follows the same rule. |
+| CR10 | UNDERSTAND -> PLAN requires actor `user` (SPEC §4 "usuario listo"): `/ewm plan` or the pane. The model is told to ask the person to run `/ewm plan`. |
+| CR11 | `run_validation` and the VALIDATE Bash rule accept a command only when its whitespace-normalized text equals a `profile.validation.commands` entry exactly, it has no shell metacharacters, and it is not destructive or network. No shell is used: compound commands belong in a package script. |
+| CR12 | Before IMPLEMENT and in VALIDATE, third-party `mcp__*` tools are allowed only when `allowed_mcp_tools` lists them, whatever `external_network` says. |
+| CR13 | `saveTask` first copies the previous task.json to `task.json.bak`; `loadTask` falls back to the backup on a parse error (audited). Audit appends never fail a mutation; `audit.jsonl` rotates to `audit.1.jsonl` past 1 MiB. |
+| CR14 | Git staleness uses `-c core.quotepath=off` and `-z` output, counts both sides of a rename, and a directory evidence path matches changed files beneath it. |
+| CR15 | The implement skill makes diff review explicit: show `git diff --stat` and the key hunks to the person and delegate a diff review to `ewm:reviewer` before advancing to VALIDATE. |
+| CR16 | Status and pane show the full model id next to the family (`haiku [claude-haiku-5-5] (ewm:repo-scout x1)`); model-written text is stripped of control characters before display; the resume brief uses trusted approvals; all artifacts re-render on every transition, pause and resume; `/ewm approve` echoes the plan hash prefix, step count and plan `updated_at`. |
+| CR17 | The write-path resolver walks up to the nearest existing ancestor, takes its real path and appends the remaining segments; with no resolvable ancestor the write is denied. |
+| CR18 | Classifier: `tree -R` is not read_only; `git submodule foreach <cmd>` and `git -c alias.<x>=<v>` are classified on their payload (a `!` alias is a shell command); network programs and outbound tools gain the ones the security review found. |
+| CR19 | Redaction also covers the validation command, URL userinfo (`scheme://user:pass@`), `Authorization`/`Cookie` headers, `_authToken`, Slack `xox?-` tokens, JWTs and Google `AIza` keys. |

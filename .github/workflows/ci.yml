@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The mod API is early access: pin the Claude Code build the mod targets.
+      - run: npm install --global @anthropic-ai/claude-code@2.1.296
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Plugin validation
+        run: claude plugin validate .
+      - name: Engine tests
+        run: claude plugin test .
+      # Typecheck needs the engine's generated declarations, which are not
+      # published; run `npm run typecheck` locally with CLAUDE_CODE_TYPES set.

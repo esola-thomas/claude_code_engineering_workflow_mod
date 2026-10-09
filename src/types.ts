@@ -269,6 +269,10 @@ export type AuditEntry = {
 export type LedgerValidation = { id: string; command: string; exit_code: number; ok: boolean; at: string }
 
 export type LedgerEntry = {
+  /** Source of truth for the task's phase (task.json's phase is a mirror the model could edit). */
+  phase: Phase
+  /** Source of truth for where a PAUSED task resumes. */
+  paused_from: ActivePhase | null
   /** Every approval a human recorded for the task (copy of the trusted record). */
   approvals: Approval[]
   /** Every validation run the mod itself executed for the task. */
