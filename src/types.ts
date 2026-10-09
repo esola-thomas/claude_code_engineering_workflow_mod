@@ -249,6 +249,7 @@ export type AuditEntry = {
     | 'tool_denied'
     | 'validation_run'
     | 'agent_spawn'
+    | 'tool_effect'
     | 'resume'
     | 'pause'
     | 'error'

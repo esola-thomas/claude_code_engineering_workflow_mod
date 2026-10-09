@@ -191,7 +191,9 @@ export function trustedTask(task: Task, entry: LedgerEntry | undefined): Task
 ```ts
 export const WRITE_TOOLS: readonly string[]      // ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
 export const SAFE_TOOLS: readonly string[]       // allowed in every active phase: ['Read', 'Glob', 'Grep', 'LS', 'LSP', 'NotebookRead', 'ToolSearch', 'Agent', 'Task',
-                                                 //  'Skill', 'AskUserQuestion', 'TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'EnterPlanMode', 'ExitPlanMode', 'ListAgents']
+                                                 //  'Skill', 'AskUserQuestion', 'TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TaskOutput', 'TaskStop',
+                                                 //  'EnterPlanMode', 'ExitPlanMode', 'ListAgents']
+export const NETWORK_READ_TOOLS: readonly string[] // ['WebFetch', 'WebSearch']: allowed in every active phase when external_network is 'allow'
 export const OUTBOUND_TOOLS: readonly string[]   // denied under deny_by_default: ['WebFetch', 'WebSearch', 'Artifact', 'ArtifactData', 'ArtifactComments', 'SendFile',
                                                  //  'SendUserFile', 'SendMessage', 'PushNotification', 'RemoteTrigger', 'PublishPlugin', 'DesignSync']
 export const ALWAYS_DENIED_TOOLS: readonly string[] // ['EnterWorktree', 'ExitWorktree'] (they move the session away from the pinned root)
@@ -254,7 +256,7 @@ export type PolicyCall = {
  *  8. OUTBOUND_TOOLS under deny_by_default -> deny; other `mcp__*` tools under deny_by_default unless allowed_mcp_tools matches (exact, or `prefix*`) -> deny (D6).
  *  9. Phase IMPLEMENT -> allow (Claude Code's own permissions still apply).
  * 10. Phases INTAKE/EXPLORE/UNDERSTAND/PLAN/VALIDATE (allowlist, F2, D4):
- *     SAFE_TOOLS -> allow; allowed mcp__* (rule 8 passed) -> allow;
+ *     SAFE_TOOLS -> allow; allowed mcp__* (rule 8 passed) -> allow; NETWORK_READ_TOOLS when external_network is 'allow' -> allow;
  *     WRITE_TOOLS -> allow only in EXPLORE with allow_write_in_explore, else deny;
  *     Bash/Monitor -> allow 'read_only'; in VALIDATE also 'validation'; else deny;
  *     anything else -> deny "ewm: <tool> is not allowed in <PHASE>".
@@ -325,7 +327,7 @@ export async function recordUsage(ctx: Ctx, usage: Partial<PhaseUsage>): Promise
 export async function recordDenial(ctx: Ctx, tool: string, reason: string): Promise<void>
 /** The pane model of the active task, or null. */
 export async function currentView(ctx: Ctx): Promise<PaneModel | null>
-/** Status-line text for the active running task ("ewm TASK-001 · EXPLORE · 2 open questions"), or null. */
+/** Status-line text for the active running task ("ewm TASK-001 · PLAN · 2 open questions · awaiting /ewm approve"), or null. */
 export async function statusLine(ctx: Ctx): Promise<string | null>
 ```
 
@@ -333,7 +335,7 @@ Implementation rules:
 
 - **Serialized writes**: every function that writes (commands, tools, spawn/usage/denial recording) runs inside one module-level async queue (`withLock`), so concurrent hooks (parallel scouts, `turn.complete`, denials, tool calls) never lose updates.
 - **Trusted gating**: every gate check, `pendingGate`, `recordApproval` and gated `transition` runs on `trustedTask(task, ledgerEntry)` with the ledger's profile; approvals and validation runs are written to both the ledger and `task.json`.
-- Every mutation: load task, apply, save task, re-render the affected artifacts (system-map.md from `task.system_map`, handoff.md only at DONE), append an audit entry.
+- Every mutation: load task, apply, save task, re-render the affected artifacts (system-map.md from `task.system_map`, handoff.md only at DONE), append an audit entry (model-tool writes use kind `tool_effect` with the tool name and a one-line summary).
 - Git: run with `cwd: root`. Paths from `git status --porcelain` are top-level relative: strip the prefix from `git rev-parse --show-prefix`; use `git diff --name-only --relative`; parse renames (`R  a -> b` -> b); drop paths under `.ewm/`.
 
 Command semantics (`runCommand`):
@@ -372,9 +374,11 @@ Model tools (`runTool`; registered as `mcp__ewm__<name>`; every one requires an 
 ## src/io-engine.ts (hooks environment only)
 
 ```ts
-import type { EngineInterface } from 'claude-code'
-/** Adapts $ to Io: fs.read/write/exists/list, process.run (cwd, timeoutMs), clock.now, store.get/set. */
-export function engineIo($: EngineInterface): Io
+/** The slice of $ the adapter needs, as plain functions. The engine refuses a hooks module that passes `$`
+ *  to a function imported from another file, so hooks/register.tsx builds this with same-file wrappers. */
+export type EngineIoSource = { fs: {...}; process: {...}; clock: {...}; store: {...} }
+/** Adapts it to Io: fs.read/write/exists/list, process.run (cwd, timeoutMs), clock.now, store.get/set. */
+export function engineIo(source: EngineIoSource): Io
 ```
 
 ## hooks/register.tsx (wiring)
@@ -385,7 +389,7 @@ export function engineIo($: EngineInterface): Io
 - `tool.call` (all tools) guard: check the `mcp__ewm__` prefix and the read-only-agent rule without file access first where possible; otherwise `activeContext` + agent type from `$.agent.list()` by `e.agentId` + resolved write path (`$.fs.stat(path, { resolve: true }).realPath`, or the parent's realPath + name) -> `evaluateToolCall`; on deny return `{ deny: reason }` and `recordDenial`. Registered with the fail-closed `.catch(($, e, next) => next.called ? next(e) : { deny: 'ewm: policy guard failed; denied to stay safe' })`. Inert (no file reads beyond the ledger) without an active running task.
 - `agent.spawn`: for `ewm:*` types, `routeModel` (rewrite `e.model`) and, when `$.agent.list()` exposes running state, deny an (N+1)th concurrent ewm scout where N = `budgets.max_parallel_researchers`; `await next(e)`; then `recordAgentSpawn` with the resolved `model`, the `routed_model` and `agentId`. Refresh view.
 - `turn.complete`: `recordUsage` from the turn's usage when present.
-- Pane: `$.ui.open({ id: 'ewm', title: 'Engineering Workflow' })`; `ui.render {component:'Pane', requestId:'ewm'}` draws `PaneModel` from `$.state` (`ewm.view`, `ewm.section`, `ewm.notice`): header, rail, counts, models, next action, and buttons `Map`, `Questions`, `Overview`, `Approve` (only with a pending gate; a press is a human origin). Approve calls `runCommand(ctx, 'approve', 'pane')`. Works on `terminal` and `desktop`.
+- Pane: `$.ui.open({ id: 'ewm', title: 'Engineering Workflow' })`; `ui.render {component:'Pane', requestId:'ewm'}` draws `PaneModel` from `$.state` (`ewm.view`, `ewm.section`, `ewm.notice`; `ewm.root` holds the pinned root across hot reloads): header, rail, counts, models, next action, and buttons `Map`, `Questions`, `Overview`, `Approve` (only with a pending gate; a press is a human origin). Approve calls `runCommand(ctx, 'approve', 'pane')`. Works on `terminal` and `desktop`.
 - Status line: `$.ui.status(statusLine)` after every change; cleared when no task is running.
 
 ## Plugin content
