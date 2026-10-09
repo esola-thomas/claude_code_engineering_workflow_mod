@@ -57,10 +57,12 @@ output before release.
 | M4 | Type safety | 0 errors, both configs | `npm run typecheck` with engine 2.1.296 types |
 | M5 | Contract conformance | every export in ARCHITECTURE.md present with its signature | Haiku audit + `tsc` |
 | M6 | FSM coverage | every edge in `EDGES` and every non-edge from each active phase asserted; both gates tested approve, reject, and stale-hash | `tests/unit/controller.spec.ts` |
-| M7 | Policy coverage | each matrix rule (1-9) has >= 1 allow and >= 1 deny test; >= 40 Bash cases including >= 15 bypass attempts (`;`, `$(..)`, backticks, redirects, `find -exec`, `sed -i`, `git -c`, quoting tricks) that must not classify as read_only | `tests/unit/permissions.spec.ts` |
+| M7 | Policy coverage | each matrix rule (1-10) has >= 1 case where it decides and >= 1 near miss where it does not; >= 60 Bash cases including >= 25 bypass attempts (`;`, `$(..)`, backticks, redirects, `$VAR`, `find -exec`, `git --output`, `rg --pre`, `sort -o`, wrappers, `sh -c`, `git -C . push`) that must not classify as read_only, and >= 10 destructive/network cases denied in IMPLEMENT | `tests/unit/permissions.spec.ts` |
 | M8 | Acceptance criteria | 6/6 covered by automated tests and 6/6 shown live with commands and outputs | test files + `docs/ACCEPTANCE.md` |
 | M9 | Adversarial review | 0 open confirmed high/critical findings | Run 2 verify stage |
 | M10 | Inert by default | no active task -> 0 denials, model tools deferred | engine tests |
+| M14 | Gate integrity | a forged approval or validation in `task.json`, or a relaxed `project.yaml`, does not open a gate; writes to `.ewm/**` are denied in every active phase | unit + engine tests |
+| M15 | No lost updates | 3 concurrent spawn recordings + a finding write all persist | unit test |
 | M11 | Model routing proof | live run records >= 1 scout spawn on the profile's search model (haiku) in `task.json.agent_usage` | `docs/ACCEPTANCE.md` |
 | M12 | Resume brief | <= 180 words | unit test |
 | M13 | Model mix | 100% of implementation tokens on Sonnet/Haiku | workflow labels |

@@ -133,8 +133,10 @@ export type Transition = {
 
 export type AgentUse = {
   agent_type: string
-  /** The model the engine resolved for the spawn (alias or full id). */
+  /** The model the engine resolved for the spawn (usually a full id such as claude-haiku-...). */
   model: string
+  /** The alias the router asked for (e.g. 'haiku'), when it routed this spawn. */
+  routed_model?: string
   agent_id?: string
   description?: string
   phase: Phase
@@ -173,6 +175,13 @@ export type ValidationRun = {
   at: string
 }
 
+export type SystemMap = {
+  mermaid: string
+  text_map: string
+  components: string[]
+  updated_at: string
+}
+
 export type PhaseUsage = {
   turns: number
   input_tokens: number
@@ -204,6 +213,8 @@ export type Task = {
   agent_usage: AgentUse[]
   validations: ValidationRun[]
   plan: Plan | null
+  /** Written only by the write_map tool; rendered to system-map.md. */
+  system_map: SystemMap | null
   usage_by_phase: Partial<Record<Phase, PhaseUsage>>
   next_action: string
   created_at: string
@@ -245,6 +256,33 @@ export type AuditEntry = {
   detail: string
   tool?: string
   commit?: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Gate ledger: mod-private state in $.store (Io.kvGet/kvSet), out of the model's
+// reach. The model can edit files in IMPLEMENT; it cannot edit the ledger. Gate
+// checks, the active-task pointer and the policy profile come from here, never
+// from files the model can write (D14).
+// ---------------------------------------------------------------------------
+
+export type LedgerValidation = { id: string; command: string; exit_code: number; ok: boolean; at: string }
+
+export type LedgerEntry = {
+  /** Every approval a human recorded for the task (copy of the trusted record). */
+  approvals: Approval[]
+  /** Every validation run the mod itself executed for the task. */
+  validations: LedgerValidation[]
+  /** Profile snapshot taken by a human command (/ewm new, /ewm resume). The guard and tools use it. */
+  profile: Profile
+  profile_source: string | null
+}
+
+export type Ledger = {
+  version: 1
+  /** The workspace root this ledger belongs to (absolute). */
+  root: string
+  active_task: string | null
+  tasks: Record<string, LedgerEntry>
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +375,10 @@ export interface Io {
   run(argv: readonly string[], opts?: { cwd?: string; timeoutMs?: number }): Promise<RunResult>
   /** Milliseconds since the epoch. */
   now(): Promise<number>
+  /** Mod-private key-value store ($.store): survives sessions, not writable by the model's tools. Undefined when unset. */
+  kvGet(key: string): Promise<unknown>
+  /** Stores JSON data under key. */
+  kvSet(key: string, value: unknown): Promise<void>
 }
 
 /** Error with a stable code; messages are shown to the person or model as-is. */

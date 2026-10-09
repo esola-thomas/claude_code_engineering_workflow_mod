@@ -55,6 +55,7 @@ export function makeTask(overrides: Partial<Task> = {}): Task {
     agent_usage: [],
     validations: [],
     plan: null,
+    system_map: null,
     usage_by_phase: {},
     next_action: 'Confirm problem, goal and success criteria with the user.',
     created_at: AT,

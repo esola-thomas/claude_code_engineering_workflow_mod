@@ -8,6 +8,8 @@ export type RunHandler = (argv: readonly string[], opts?: { cwd?: string; timeou
 export type MemoryIo = Io & {
   /** Current file contents by normalized path. */
   files: Map<string, string>
+  /** The mod-private key-value store behind kvGet/kvSet. */
+  kv: Map<string, unknown>
   /** Every argv passed to run(), in order. */
   runs: (readonly string[])[]
   /** Replace how run() answers (default: exit 127, "not found"). */
@@ -37,6 +39,7 @@ export function createMemoryIo(initial: Record<string, string> = {}, startMs = D
   const files = new Map<string, string>()
   for (const [path, text] of Object.entries(initial)) files.set(normalizePath(path), text)
   const runs: (readonly string[])[] = []
+  const kv = new Map<string, unknown>()
   let now = startMs
   let handler: RunHandler = () => ({ exitCode: 127, stdout: '', stderr: 'command not found' })
 
@@ -48,6 +51,7 @@ export function createMemoryIo(initial: Record<string, string> = {}, startMs = D
 
   return {
     files,
+    kv,
     runs,
     onRun(next) {
       handler = next
@@ -91,6 +95,14 @@ export function createMemoryIo(initial: Record<string, string> = {}, startMs = D
     },
     async now() {
       return now
+    },
+    async kvGet(key) {
+      const value = kv.get(key)
+      // Round-trip through JSON like $.store does, so callers cannot share references.
+      return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+    },
+    async kvSet(key, value) {
+      kv.set(key, JSON.parse(JSON.stringify(value)))
     },
   }
 }
