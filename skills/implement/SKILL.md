@@ -32,7 +32,11 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 4. If the work needs more than that, for example a changed approach, new files outside the scope, or a wrong assumption, stop editing and ask the person. Record their answer with mcp__ewm__decision. A design change returns to PLAN, and from IMPLEMENT the only way is through VALIDATE: call mcp__ewm__advance to VALIDATE, then to PLAN, with the reason. The new plan needs a new approval.
 5. Skip a step only with a recorded decision that says why, then mark it "skipped".
 6. Do not commit or push unless the person asks. git push is denied anyway.
-7. Before leaving IMPLEMENT, optionally ask `ewm:reviewer` to review the diff. Give it the base commit (`repo.base_commit` in `.ewm/tasks/<id>/task.json`), the plan summary and N. Fix the blockers and majors it finds, re-show the diff, and record anything you decide not to fix as a decision.
+7. Review the diff before leaving IMPLEMENT. This is required, not optional:
+   1. Show the person `git diff --stat` and the key hunks (the ones that carry the change, not every line).
+   2. Delegate a diff review to `ewm:reviewer` with the Agent tool. Give it the base commit (`repo.base_commit` in `.ewm/tasks/<id>/task.json`), the plan summary and N. Wait for its result.
+   3. Read the cited lines yourself. Fix the blockers and majors that hold up, re-show the changed hunks, and record each issue you decide not to fix as a decision (title starting "Review:") with the reason.
+   4. Record the outcome with mcp__ewm__decision (title "Review: <result>", for example "Review: 0 blockers, 2 minors fixed, 1 minor deferred"). handoff.md states whether the reviewer ran; do not call mcp__ewm__advance to VALIDATE before this is done.
 
 ## Stop and ask when
 
@@ -48,6 +52,7 @@ A good deviation record: title "Deviation: S-2 uses the existing parser", choice
 - Every plan step is "done" or "skipped", and each skip has a decision.
 - Every deviation is recorded and the person has seen it.
 - The diff contains only what the plan and the recorded decisions allow: no stray debug code, no unrelated formatting.
+- The person has seen `git diff --stat` and the key hunks, `ewm:reviewer` has reviewed the diff, and the outcome is recorded as a decision.
 - The tests the plan lists exist. Running them is VALIDATE's job; do not run them here.
 
 ## Delegation rules
@@ -70,4 +75,4 @@ Report after each step: what changed, the diff, what is next. After at most `max
 
 ## Exit
 
-When every step is done or skipped, summarize the full diff and the deviations, then call mcp__ewm__advance with `{to:'VALIDATE', reason:'steps complete'}`. If the person wants to stop, tell them to run /ewm pause.
+When every step is done or skipped and the diff review (step 7) is recorded, summarize the full diff and the deviations, then call mcp__ewm__advance with `{to:'VALIDATE', reason:'steps complete'}`. If the person wants to stop, tell them to run /ewm pause.

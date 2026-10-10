@@ -251,3 +251,27 @@ describe('USAGE', () => {
     assert.match(USAGE, /^[\x20-\x7e\n]+$/)
   })
 })
+
+describe('parseCommand: approve --plan <hash> (the approval carries the plan the person read)', () => {
+  it('parses the hash prefix, lower-cased, with or without a note', () => {
+    assert.deepEqual(parseCommand('approve --plan 6EC3494E'), { name: 'approve', plan: '6ec3494e' })
+    assert.deepEqual(parseCommand('approve --plan 6ec3494e looks right'), { name: 'approve', plan: '6ec3494e', note: 'looks right' })
+    assert.deepEqual(parseCommand('approve --plan=6ec3494e'), { name: 'approve', plan: '6ec3494e' })
+    const full = 'a'.repeat(64)
+    assert.deepEqual(parseCommand(`approve --plan ${full}`), { name: 'approve', plan: full })
+  })
+
+  it('rejects a missing or malformed hash with an explanation', () => {
+    for (const input of ['approve --plan', 'approve --plan nothex', 'approve --plan 123', `approve --plan ${'a'.repeat(65)}`]) {
+      assertParseError(input, '--plan needs')
+    }
+  })
+
+  it('keeps an ordinary note that merely mentions a hash', () => {
+    assert.deepEqual(parseCommand('approve plan 6ec3494e is fine'), { name: 'approve', note: 'plan 6ec3494e is fine' })
+  })
+
+  it('does not apply to reject', () => {
+    assert.deepEqual(parseCommand('reject --plan 6ec3494e'), { name: 'reject', note: '--plan 6ec3494e' })
+  })
+})

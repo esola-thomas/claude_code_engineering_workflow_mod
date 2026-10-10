@@ -39,18 +39,25 @@ export function modelFamily(model: string): string {
   return MODEL_FAMILIES.find((family) => lower.includes(family)) ?? model
 }
 
-/** "haiku (ewm:repo-scout x2)" lines: grouped by modelFamily(routed_model ?? model) then agent type, in first-seen order.
- *  One line per family; several agent types in a family are joined: "haiku (ewm:repo-scout x2, ewm:docs-scout x1)". */
+/** Lines like "haiku [claude-haiku-5-5] (ewm:repo-scout x2)" (CR16): grouped by the family of the model the engine RESOLVED (`model`, else the requested alias),
+ *  then agent type, in first-seen order. The resolved id is shown in brackets when it is not just the alias. One line per family; several agent types in
+ *  a family are joined: "haiku [claude-haiku-5-5] (ewm:repo-scout x2, ewm:docs-scout x1)". When the engine resolved a different family than the router
+ *  asked for, the line says so: "opus [claude-opus-4-1] (ewm:repo-scout x1) - asked for haiku". */
 export function summarizeModels(uses: readonly AgentUse[]): string[] {
   // Map keeps insertion order, which is the first-seen order we want at both levels.
-  const families = new Map<string, Map<string, number>>()
+  const families = new Map<string, { types: Map<string, number>; ids: Set<string>; asked: Set<string> }>()
   for (const use of uses) {
-    const family = modelFamily(use.routed_model || use.model)
-    const types = families.get(family) ?? new Map<string, number>()
-    types.set(use.agent_type, (types.get(use.agent_type) ?? 0) + 1)
-    families.set(family, types)
+    const resolved = use.model || use.routed_model || ''
+    const family = modelFamily(resolved)
+    const entry = families.get(family) ?? { types: new Map<string, number>(), ids: new Set<string>(), asked: new Set<string>() }
+    entry.types.set(use.agent_type, (entry.types.get(use.agent_type) ?? 0) + 1)
+    if (resolved !== '' && resolved !== family) entry.ids.add(resolved)
+    if (use.routed_model && modelFamily(use.routed_model) !== family) entry.asked.add(use.routed_model)
+    families.set(family, entry)
   }
-  return [...families].map(
-    ([family, types]) => `${family} (${[...types].map(([agentType, count]) => `${agentType} x${count}`).join(', ')})`,
-  )
+  return [...families].map(([family, entry]) => {
+    const ids = entry.ids.size === 0 ? '' : ` [${[...entry.ids].join(', ')}]`
+    const asked = entry.asked.size === 0 ? '' : ` - asked for ${[...entry.asked].join(', ')}`
+    return `${family}${ids} (${[...entry.types].map(([agentType, count]) => `${agentType} x${count}`).join(', ')})${asked}`
+  })
 }

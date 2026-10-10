@@ -3,12 +3,14 @@ import assert from 'node:assert/strict'
 import {
   EWM_DIR,
   appendAudit,
+  createLedgerEntry,
   createTask,
   ensureWorkspace,
   joinPath,
   listTasks,
   loadLedger,
   loadTask,
+  loadTaskRecovering,
   ledgerKey,
   nextTaskId,
   readArtifact,
@@ -634,7 +636,7 @@ describe('gate ledger', () => {
 
     it('keeps ledgers of different roots apart', async () => {
       const io = createMemoryIo()
-      await saveLedger(io, ROOT, { version: 1, root: ROOT, active_task: 'TASK-001', tasks: {} })
+      await saveLedger(io, ROOT, { version: 1, root: ROOT, active_task: 'TASK-001', tasks: { 'TASK-001': goodEntry() } })
       assert.equal((await loadLedger(io, '/other')).active_task, null)
       assert.equal((await loadLedger(io, ROOT)).active_task, 'TASK-001')
     })
@@ -645,7 +647,7 @@ describe('gate ledger', () => {
       assert.equal(io.files.size, 0)
     })
 
-    const goodEntry = (): LedgerEntry => ({ approvals: [approval()], validations: [{ id: 'V-001', command: 'npm test', exit_code: 0, ok: true, at: AT }], profile: makeProfile(), profile_source: null })
+    const goodEntry = (): LedgerEntry => ({ phase: 'PLAN', paused_from: null, approvals: [approval()], validations: [{ id: 'V-001', command: 'npm test', exit_code: 0, ok: true, at: AT }], profile: makeProfile(), profile_source: null })
     const base = (): Record<string, unknown> => ({ version: 1, root: ROOT, active_task: null, tasks: {} })
     const malformed: [string, unknown][] = [
       ['a string', 'garbage'],
@@ -667,6 +669,11 @@ describe('gate ledger', () => {
       ['an approval by the model', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), approvals: [{ ...approval(), by: 'model' }] } } }],
       ['a null approval', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), approvals: [null] } } }],
       ['a validation without an exit code', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), validations: [{ id: 'V-001', command: 'x', ok: true, at: AT }] } } }],
+      ['a missing phase', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), phase: undefined } } }],
+      ['an unknown phase', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), phase: 'LAUNCH' } } }],
+      ['a paused_from that is not an active phase', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), paused_from: 'DONE' } } }],
+      ['a missing paused_from', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), paused_from: undefined } } }],
+      ['an active task with no ledger entry (its phase would be untrusted)', { ...base(), active_task: 'TASK-001' }],
       ['a profile_source that is a number', { ...base(), tasks: { 'TASK-001': { ...goodEntry(), profile_source: 3 } } }],
     ]
     for (const [label, value] of malformed) {
@@ -693,7 +700,14 @@ describe('gate ledger', () => {
 
     it('creates the entry from the profile when it does not exist', () => {
       const updated = updateLedgerEntry(empty(), 'TASK-001', identity, init)
-      assert.deepEqual(updated.tasks['TASK-001'], { approvals: [], validations: [], profile: makeProfile(), profile_source: '.ewm/project.yaml' })
+      assert.deepEqual(updated.tasks['TASK-001'], {
+        phase: 'INTAKE',
+        paused_from: null,
+        approvals: [],
+        validations: [],
+        profile: makeProfile(),
+        profile_source: '.ewm/project.yaml',
+      })
     })
 
     it('passes the created entry to fn', () => {
@@ -771,6 +785,8 @@ describe('gate ledger', () => {
 
   describe('trustedTask', () => {
     const entry = (overrides: Partial<LedgerEntry> = {}): LedgerEntry => ({
+      phase: 'INTAKE',
+      paused_from: null,
       approvals: [],
       validations: [],
       profile: makeProfile(),
@@ -818,9 +834,37 @@ describe('gate ledger', () => {
 
     it('keeps every other field of the task', () => {
       const task = makeTask({ phase: 'VALIDATE', title: 'Keep me', approvals: [approval()], validations: [run()] })
-      const trusted = trustedTask(task, entry({ validations: [{ id: 'V-001', command: 'npm test', exit_code: 0, ok: true, at: AT }] }))
+      const trusted = trustedTask(task, entry({ phase: 'VALIDATE', validations: [{ id: 'V-001', command: 'npm test', exit_code: 0, ok: true, at: AT }] }))
       assert.deepEqual({ ...trusted, approvals: [], validations: [] }, { ...task, approvals: [], validations: [] })
       assert.deepEqual(trusted.validations, [run()])
+    })
+
+    it('takes phase and paused_from from the ledger, whatever task.json says (CR5)', () => {
+      const forged = makeTask({ phase: 'IMPLEMENT', paused_from: 'IMPLEMENT' })
+      const trusted = trustedTask(forged, entry({ phase: 'PAUSED', paused_from: 'PLAN' }))
+      assert.equal(trusted.phase, 'PAUSED')
+      assert.equal(trusted.paused_from, 'PLAN')
+    })
+
+    it('without an entry a task cannot be past PLAN, nor resume past PLAN', () => {
+      for (const phase of ['IMPLEMENT', 'VALIDATE', 'DONE'] as const) {
+        assert.equal(trustedTask(makeTask({ phase }), undefined).phase, 'PLAN', phase)
+      }
+      assert.equal(trustedTask(makeTask({ phase: 'EXPLORE' }), undefined).phase, 'EXPLORE')
+      const paused = trustedTask(makeTask({ phase: 'PAUSED', paused_from: 'VALIDATE' }), undefined)
+      assert.equal(paused.phase, 'PAUSED')
+      assert.equal(paused.paused_from, 'PLAN')
+    })
+
+    it('takes ok, at and the command of a validation from the ledger, so task.json cannot turn a failure into a pass (CR9)', () => {
+      const forged = run({ id: 'V-001', exit_code: 1, ok: true, at: '2099-01-01T00:00:00.000Z', command: 'echo fine' })
+      const trusted = trustedTask(
+        makeTask({ validations: [forged] }),
+        entry({ validations: [{ id: 'V-001', command: 'npm test', exit_code: 1, ok: false, at: AT }] }),
+      )
+      assert.equal(trusted.validations[0]?.ok, false)
+      assert.equal(trusted.validations[0]?.at, AT)
+      assert.equal(trusted.validations[0]?.command, 'npm test')
     })
 
     it('does not mutate the task or the ledger entry, and shares no approval objects', () => {
@@ -832,5 +876,140 @@ describe('gate ledger', () => {
       assert.equal(task.approvals.length, 1)
       assert.equal(ledgerEntry.approvals.length, 1)
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run 2 hardening: CR7, CR13, CR19
+// ---------------------------------------------------------------------------
+
+describe('CR7: nextTaskId counts the ledger too', () => {
+  it('returns max(task directories, ledger ids) + 1', async () => {
+    const io = createMemoryIo()
+    const ledger: Ledger = { version: 1, root: ROOT, active_task: null, tasks: {} }
+    const withIds = (...ids: string[]): Ledger => ids.reduce((acc, id) => updateLedgerEntry(acc, id, entry => entry, { profile: makeProfile(), profile_source: null }), ledger)
+    assert.equal(await nextTaskId(io, ROOT, withIds('TASK-004')), 'TASK-005', 'no directory at all')
+    await seedTask(io, 'TASK-007')
+    assert.equal(await nextTaskId(io, ROOT, withIds('TASK-004')), 'TASK-008', 'directories win when higher')
+    assert.equal(await nextTaskId(io, ROOT, withIds('TASK-004', 'TASK-012')), 'TASK-013', 'ledger wins when higher')
+    assert.equal(await nextTaskId(io, ROOT), 'TASK-008', 'without a ledger it is the directory scan')
+  })
+
+  it('createLedgerEntry starts a task with nothing approved and a private copy of the profile', () => {
+    const profile = makeProfile()
+    const entry = createLedgerEntry({ profile, profile_source: 'x' })
+    assert.deepEqual(entry, { phase: 'INTAKE', paused_from: null, approvals: [], validations: [], profile, profile_source: 'x' })
+    assert.notEqual(entry.profile, profile)
+    assert.equal(createLedgerEntry({ profile, profile_source: null }, 'PLAN').phase, 'PLAN')
+  })
+})
+
+describe('CR13: task.json backup and audit rotation', () => {
+  it('saveTask keeps the previous valid task.json as task.json.bak', async () => {
+    const io = createMemoryIo()
+    await saveTask(io, ROOT, makeTask({ title: 'one' }))
+    assert.equal(io.files.has(`${TASKS}/TASK-001/task.json.bak`), false, 'nothing to back up on the first save')
+    await saveTask(io, ROOT, makeTask({ title: 'two' }))
+    assert.equal(JSON.parse(io.files.get(`${TASKS}/TASK-001/task.json.bak`) ?? '').title, 'one')
+    assert.equal((await loadTask(io, ROOT, 'TASK-001')).title, 'two')
+  })
+
+  it('does not replace a good backup with a damaged task.json', async () => {
+    const io = createMemoryIo()
+    await saveTask(io, ROOT, makeTask({ title: 'one' }))
+    await saveTask(io, ROOT, makeTask({ title: 'two' }))
+    await io.writeText(`${TASKS}/TASK-001/task.json`, '{ truncated')
+    await saveTask(io, ROOT, makeTask({ title: 'three' }))
+    assert.equal(JSON.parse(io.files.get(`${TASKS}/TASK-001/task.json.bak`) ?? '').title, 'one')
+  })
+
+  it('still saves when the backup cannot be written', async () => {
+    const io = createMemoryIo()
+    await saveTask(io, ROOT, makeTask({ title: 'one' }))
+    const write = io.writeText.bind(io)
+    io.writeText = async (path, text) => {
+      if (path.endsWith('.bak')) throw new Error('read-only')
+      return write(path, text)
+    }
+    await saveTask(io, ROOT, makeTask({ title: 'two' }))
+    assert.equal((await loadTask(io, ROOT, 'TASK-001')).title, 'two')
+  })
+
+  it('loadTask falls back to task.json.bak on a parse error, loadTaskRecovering says so', async () => {
+    const io = createMemoryIo()
+    await saveTask(io, ROOT, makeTask({ title: 'one' }))
+    await saveTask(io, ROOT, makeTask({ title: 'two' }))
+    assert.deepEqual(await loadTaskRecovering(io, ROOT, 'TASK-001').then(r => r.recovered), false)
+    await io.writeText(`${TASKS}/TASK-001/task.json`, 'not json')
+    const recovered = await loadTaskRecovering(io, ROOT, 'TASK-001')
+    assert.equal(recovered.recovered, true)
+    assert.equal(recovered.task.title, 'one')
+    assert.equal((await loadTask(io, ROOT, 'TASK-001')).title, 'one')
+  })
+
+  it('does not fall back for a missing task, a wrong id in the file, or a damaged backup', async () => {
+    const io = createMemoryIo()
+    await assertEwmError(() => loadTask(io, ROOT, 'TASK-001'), 'not_found')
+    await saveTask(io, ROOT, makeTask({ title: 'one' }))
+    await saveTask(io, ROOT, makeTask({ title: 'two' }))
+    await io.writeText(`${TASKS}/TASK-001/task.json.bak`, '{ also broken')
+    await io.writeText(`${TASKS}/TASK-001/task.json`, '{ broken')
+    await assertEwmError(() => loadTask(io, ROOT, 'TASK-001'), 'parse_error')
+    await io.writeText(`${TASKS}/TASK-001/task.json`, JSON.stringify(makeTask({ id: 'TASK-009' })))
+    await io.writeText(`${TASKS}/TASK-001/task.json.bak`, JSON.stringify(makeTask({ title: 'backup' })))
+    assert.equal((await loadTask(io, ROOT, 'TASK-001')).title, 'backup', 'a file for another task is a parse error, so the backup stands in')
+  })
+
+  it('appendAudit moves a log of 1 MiB or more to audit.1.jsonl and starts a new one', async () => {
+    const io = createMemoryIo()
+    const big = 'x'.repeat(1024 * 1024)
+    await io.writeText(`${TASKS}/TASK-001/audit.jsonl`, big)
+    await appendAudit(io, ROOT, 'TASK-001', { at: AT, kind: 'error', phase: null, detail: 'after rotation' })
+    assert.equal(io.files.get(`${TASKS}/TASK-001/audit.1.jsonl`), big)
+    const lines = (io.files.get(`${TASKS}/TASK-001/audit.jsonl`) ?? '').trim().split('\n')
+    assert.equal(lines.length, 1)
+    assert.equal(JSON.parse(lines[0] ?? '').detail, 'after rotation')
+  })
+
+  it('appendAudit leaves a smaller log in place', async () => {
+    const io = createMemoryIo()
+    await appendAudit(io, ROOT, 'TASK-001', { at: AT, kind: 'error', phase: null, detail: 'one' })
+    await appendAudit(io, ROOT, 'TASK-001', { at: AT, kind: 'error', phase: null, detail: 'two' })
+    assert.equal(io.files.has(`${TASKS}/TASK-001/audit.1.jsonl`), false)
+    assert.equal((io.files.get(`${TASKS}/TASK-001/audit.jsonl`) ?? '').trim().split('\n').length, 2)
+  })
+})
+
+describe('CR19: redactSecrets covers the shapes the security review found', () => {
+  const masked: [string, string, string][] = [
+    ['an Authorization Basic header', 'Authorization: Basic dXNlcjpwYXNz', 'Authorization: Basic [REDACTED]'],
+    ['a proxy authorization header', 'Proxy-Authorization: Basic dXNlcjpwYXNz', 'Proxy-Authorization: Basic [REDACTED]'],
+    ['an API key header', 'x-api-key: abcdefgh12345', 'x-api-key: [REDACTED]'],
+    ['a Cookie header', 'Cookie: session=abcdefghijklmnop; theme=dark', 'Cookie: [REDACTED]'],
+    ['URL userinfo', 'postgres://u:pw123@h/db', 'postgres://u:[REDACTED]@h/db'],
+    ['URL userinfo in an assignment', 'DATABASE_URL=postgres://u:pw123@h/db', 'DATABASE_URL=postgres://u:[REDACTED]@h/db'],
+    ['a JWT', `token ${fake('eyJ', 'hbGciOiJIUzI1NiJ9')}.${fake('eyJ', 'zdWIiOiIxMjM0NTY3ODkwIn0')}.abcdefghij`, 'token [REDACTED]'],
+    ['a Slack token', fake('xo', 'xb-1234567890-abcdefghij'), '[REDACTED]'],
+    ['an npm token', fake('npm', '_abcdefghijklmnopqrstuvwxyz0123456789'), '[REDACTED]'],
+    ['a GitLab token', fake('glpat', '-abcdefghijklmnopqrst'), '[REDACTED]'],
+    ['a Google API key', fake('AIza', 'SyA1234567890abcdefghijklmnopqrstu'), '[REDACTED]'],
+    ['a Stripe key', fake('sk_', 'live_abcdefghijklmnopqrstuvwx'), '[REDACTED]'],
+    ['a flag followed by its value', 'npm test --token abc123def456', 'npm test --token [REDACTED]'],
+    ['a password flag', 'mysql --password hunter2 -e x', 'mysql --password [REDACTED] -e x'],
+    ['a YAML-style key', 'password: hunter2', 'password: [REDACTED]'],
+    ['a spaced assignment with a quoted value', 'api_key = "abc def"', 'api_key = "[REDACTED]"'],
+    ['an npm auth line', '//registry.npmjs.org/:_authToken=abc123', '//registry.npmjs.org/:_authToken=[REDACTED]'],
+  ]
+  for (const [label, input, expected] of masked) {
+    it(`masks ${label}`, () => {
+      assert.equal(redactSecrets(input), expected)
+      assert.equal(redactSecrets(redactSecrets(input)), expected, 'idempotent')
+    })
+  }
+
+  it('leaves ordinary text alone', () => {
+    for (const text of ['Author: John Smith', 'Unexpected token: ;', 'ssh://git@github.com/org/repo', 'npm test --reporter dot', 'author = me']) {
+      assert.equal(redactSecrets(text), text, text)
+    }
   })
 })

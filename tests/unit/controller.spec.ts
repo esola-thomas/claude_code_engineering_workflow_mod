@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { describe, it } from 'node:test'
 
 import {
   EDGES,
+  freshValidations,
   checkTransition,
   defaultNextAction,
   hasValidApproval,
@@ -143,10 +145,13 @@ describe('every edge is allowed when its prerequisites are satisfied', () => {
     for (const to of EDGES[from]) {
       it(`${from} -> ${to}`, () => {
         const task = readyTask(from)
+        // CR10: UNDERSTAND > PLAN is the person's call; every other edge is open to every actor once its prerequisites hold.
+        const personOnly = from === 'UNDERSTAND' && to === 'PLAN'
         for (const actor of ACTORS) {
+          if (personOnly && actor !== 'user') continue
           assert.deepEqual(checkTransition(task, to, actor, strict), { ok: true }, `actor ${actor}`)
         }
-        const next = transition(task, to, 'model', 'because', LATER, strict)
+        const next = transition(task, to, personOnly ? 'user' : 'model', 'because', LATER, strict)
         assert.equal(next.phase, to)
       })
     }
@@ -336,7 +341,7 @@ describe('pause and resume', () => {
 
   it('a resumed task follows the edges of the phase it returned to', () => {
     const resumed = resume(pause(readyTask('UNDERSTAND'), LATER), LATER)
-    assert.equal(checkTransition(resumed, 'PLAN', 'model', strict).ok, true)
+    assert.equal(checkTransition(resumed, 'PLAN', 'user', strict).ok, true)
     assert.equal(checkTransition(resumed, 'IMPLEMENT', 'model', strict).ok, false)
   })
 
@@ -361,8 +366,26 @@ describe('pause and resume', () => {
 // ---------------------------------------------------------------------------
 
 describe('planHash', () => {
-  it('is eight lowercase hex digits', () => {
-    assert.match(planHash(planContent()), /^[0-9a-f]{8}$/)
+  it('is SHA-256 in lowercase hex: 64 digits (CR8)', () => {
+    assert.match(planHash(planContent()), /^[0-9a-f]{64}$/)
+  })
+
+  it('is the SHA-256 of the canonical JSON of summary, steps (text, files), risks, tests and alternatives', () => {
+    const content = planContent()
+    const canonical = JSON.stringify({
+      summary: content.summary,
+      steps: content.steps.map(step => ({ text: step.text, files: step.files })),
+      risks: content.risks,
+      tests: content.tests,
+      alternatives: content.alternatives,
+    })
+    assert.equal(planHash(content), createHash('sha256').update(canonical).digest('hex'))
+  })
+
+  it('does not collide for the suffix that made two different plans share a 32-bit FNV-1a hash (D3 bypass)', () => {
+    const approved = planContent({ summary: 'add logging' })
+    const swapped = planContent({ summary: 'add logging AND rm -rf (malicious)', alternatives: ['rewrite with reduce' + 'g7/#9C'] })
+    assert.notEqual(planHash(approved), planHash(swapped))
   })
 
   it('is stable across calls and across equal copies', () => {
@@ -371,10 +394,10 @@ describe('planHash', () => {
     assert.equal(planHash(content), planHash(structuredClone(content)))
   })
 
-  it('keeps known values, so a stored approval survives a release (FNV-1a 32 over UTF-8 canonical JSON)', () => {
-    assert.equal(planHash(planContent()), '3cf80f1f')
-    assert.equal(planHash(planContent({ summary: 'Añadir ✓ 😀' })), '84f5666b')
-    assert.equal(planHash({ summary: '', steps: [], risks: [], tests: [], alternatives: [] }), 'aa442719')
+  it('keeps known values, so a stored approval survives a release (SHA-256 over UTF-8 canonical JSON)', () => {
+    assert.equal(planHash(planContent()), '729747cd054e0ffcf7d8c457f81aa6cd06acdf6967a5453b9b3e2bd84963ee47')
+    assert.equal(planHash(planContent({ summary: 'Añadir ✓ 😀' })), 'e0d2833d2c9c3b6e53898bf3a0ff5e50aaeff1030a2c1339eadc02b90ce18992')
+    assert.equal(planHash({ summary: '', steps: [], risks: [], tests: [], alternatives: [] }), '016301f8e8d3de3059ddf2f856b4286db3949f0a33f2370e9e1502b54f10be4d')
   })
 
   const base = planContent()
@@ -867,7 +890,7 @@ describe('lifecycle', () => {
     step('UNDERSTAND')
     step('EXPLORE')
     step('UNDERSTAND')
-    step('PLAN')
+    step('PLAN', 'user')
     assert.equal(pendingGate(task, strict), null, 'no plan yet')
 
     task = deepFreeze({ ...task, plan })
@@ -885,7 +908,8 @@ describe('lifecycle', () => {
     assert.equal(pendingGate(task, strict), null, 'no validation run yet')
     assertEwmError(() => step('DONE'), 'gate_required')
 
-    task = deepFreeze({ ...task, validations: [makeValidation()] })
+    // Recorded after the task entered VALIDATE (at LATER): CR9.
+    task = deepFreeze({ ...task, validations: [makeValidation({ at: LATER })] })
     assert.equal(pendingGate(task, strict), 'done_acceptance')
     assertEwmError(() => step('DONE'), 'gate_required')
 
@@ -925,5 +949,98 @@ describe('lifecycle', () => {
     const replanned = frozenTask({ phase: 'PLAN', plan: makePlan({ steps: [makeStep(), makeStep({ id: 'S-2', text: 'Extra step' })] }), approvals: [planApproval(original)] })
     assert.equal(pendingGate(replanned, strict), 'plan_approval')
     assertEwmError(() => transition(replanned, 'IMPLEMENT', 'model', 'go', LATER, strict), 'gate_required')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Hardening: CR9 (fresh, passing validation), CR10 (person-only UNDERSTAND > PLAN), resume clamp (CR5)
+// ---------------------------------------------------------------------------
+
+describe('CR9: acceptance needs a passing validation recorded since entering VALIDATE', () => {
+  const entered = (at: string) => ({ from: 'IMPLEMENT', to: 'VALIDATE', actor: 'model', reason: 'steps done', at }) as const
+  const EARLIER = '2026-10-09T16:00:00.000Z'
+
+  it('a failing run opens no gate and blocks DONE with a reason that says why', () => {
+    const task = readyTask('VALIDATE', { validations: [makeValidation({ ok: false, exit_code: 1 })], approvals: [planApproval(makePlan())], transitions: [entered(AT)] })
+    assert.equal(pendingGate(task, strict), null)
+    assertRejected(checkTransition(task, 'DONE', 'user', strict), /passing validation run/)
+    assertEwmError(() => recordApproval(task, 'done_acceptance', 'approved', 'command', LATER, strict), 'invalid_input', /no passing validation run/)
+  })
+
+  it('a pass from before the latest entry into VALIDATE does not count', () => {
+    const task = readyTask('VALIDATE', {
+      validations: [makeValidation({ at: EARLIER })],
+      approvals: [planApproval(makePlan())],
+      transitions: [entered(EARLIER), { from: 'VALIDATE', to: 'IMPLEMENT', actor: 'model', reason: 'rewrite', at: AT }, { ...entered(LATER) }],
+    })
+    assert.equal(pendingGate(task, strict), null)
+    assertRejected(checkTransition(task, 'DONE', 'user', strict), /code changed after the last pass/)
+  })
+
+  it('a pass recorded after the latest entry opens done_acceptance', () => {
+    const task = readyTask('VALIDATE', {
+      validations: [makeValidation({ at: LATER })],
+      approvals: [planApproval(makePlan())],
+      transitions: [entered(AT)],
+    })
+    assert.equal(pendingGate(task, strict), 'done_acceptance')
+  })
+
+  it('a fresh pass counts even when an earlier run failed', () => {
+    const task = readyTask('VALIDATE', {
+      validations: [makeValidation({ ok: false, exit_code: 1 }), makeValidation({ id: 'V-002', at: LATER })],
+      approvals: [planApproval(makePlan())],
+      transitions: [entered(AT)],
+    })
+    assert.equal(freshValidations(task).map(run => run.id).join(), 'V-002')
+    assert.equal(pendingGate(task, strict), 'done_acceptance')
+  })
+})
+
+describe('CR10: UNDERSTAND > PLAN is the person\'s call', () => {
+  it('refuses the model and the system, naming /ewm plan', () => {
+    const task = readyTask('UNDERSTAND')
+    for (const actor of ['model', 'system'] as const) {
+      assertRejected(checkTransition(task, 'PLAN', actor, strict), /\/ewm plan/)
+      assertEwmError(() => transition(task, 'PLAN', actor, 'ready', LATER, strict), 'gate_required', /\/ewm plan/)
+    }
+    assert.deepEqual(checkTransition(task, 'PLAN', 'user', strict), { ok: true })
+  })
+
+  it('does not restrict going back to EXPLORE or the other edges into PLAN', () => {
+    assert.deepEqual(checkTransition(readyTask('UNDERSTAND'), 'EXPLORE', 'model', strict), { ok: true })
+    assert.deepEqual(checkTransition(readyTask('VALIDATE'), 'PLAN', 'model', strict), { ok: true })
+  })
+})
+
+describe('resume() with a profile clamps to what the approvals justify (CR5)', () => {
+  it('returns to PLAN, not IMPLEMENT, when the plan has no valid approval', () => {
+    const paused = frozenTask({ phase: 'PAUSED', paused_from: 'IMPLEMENT', plan: makePlan(), approvals: [] })
+    const resumed = resume(paused, LATER, strict)
+    assert.equal(resumed.phase, 'PLAN')
+    assert.match(resumed.transitions.at(-1)?.reason ?? '', /PLAN instead of IMPLEMENT/)
+    assert.equal(resumed.next_action, defaultNextAction('PLAN'))
+  })
+
+  it('also clamps VALIDATE, and a plan edited after approval', () => {
+    const approved = makePlan()
+    const edited = makePlan({ summary: 'something else' })
+    const paused = frozenTask({ phase: 'PAUSED', paused_from: 'VALIDATE', plan: edited, approvals: [planApproval(approved)] })
+    assert.equal(resume(paused, LATER, strict).phase, 'PLAN')
+  })
+
+  it('keeps IMPLEMENT when the plan is approved, or approval is not required', () => {
+    const plan = makePlan()
+    const approvedTask = frozenTask({ phase: 'PAUSED', paused_from: 'IMPLEMENT', plan, approvals: [planApproval(plan)] })
+    assert.equal(resume(approvedTask, LATER, strict).phase, 'IMPLEMENT')
+    const noApproval = frozenTask({ phase: 'PAUSED', paused_from: 'IMPLEMENT', plan, approvals: [] })
+    assert.equal(resume(noApproval, LATER, relaxed).phase, 'IMPLEMENT')
+  })
+
+  it('never clamps earlier phases, and does not clamp without a profile', () => {
+    const paused = frozenTask({ phase: 'PAUSED', paused_from: 'EXPLORE' })
+    assert.equal(resume(paused, LATER, strict).phase, 'EXPLORE')
+    const forged = frozenTask({ phase: 'PAUSED', paused_from: 'IMPLEMENT' })
+    assert.equal(resume(forged, LATER).phase, 'IMPLEMENT')
   })
 })

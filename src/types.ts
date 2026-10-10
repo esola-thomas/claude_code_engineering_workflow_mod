@@ -76,6 +76,8 @@ export type Evidence = {
   /** Optional doc/section identifier (ADR number, spec section, heading). */
   doc_id?: string
   note?: string
+  /** Git blob id of the file when the finding was recorded (`git hash-object`); absent for directories or without git. Staleness compares it (CR14). */
+  fingerprint?: string
 }
 
 export type Finding = {
@@ -328,6 +330,8 @@ export type PaneModel = {
   /** e.g. ["haiku (ewm:repo-scout x2)", "sonnet (ewm:reviewer x1)"] */
   models: string[]
   pending_gate: GateName | null
+  /** The plan awaiting approval, as the person is shown it (hash = full SHA-256: the Approve button carries it back); null when no plan gate is pending. */
+  plan: { hash: string; steps: number; summary: string } | null
   next_action: string
   /** Text lines for the 'map' section (from system-map.md's text map or components). */
   map_lines: string[]

@@ -14,6 +14,8 @@ export type EwmPaneView = {
   counts: { components: number; sources: number; open_questions: number; risks: number; findings: number; stale: number }
   models: string[]
   pending_gate: string | null
+  /** The plan awaiting approval as shown to the person; hash is the full SHA-256 the Approve button carries back. */
+  plan: { hash: string; steps: number; summary: string } | null
   next_action: string
   map_lines: string[]
   question_lines: string[]

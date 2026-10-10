@@ -132,7 +132,10 @@ async function advance(env: Env, to: string): Promise<void> {
 async function toPlan(env: Env): Promise<void> {
   await startTask(env)
   await expectOk(tool(env, 'set_intake', { success_criteria: ['sum() is right'], constraints: [] }))
-  for (const to of ['EXPLORE', 'UNDERSTAND', 'PLAN']) await advance(env, to)
+  for (const to of ['EXPLORE', 'UNDERSTAND']) await advance(env, to)
+  // CR10: the person decides when to plan.
+  const planned = await cmd(env, 'plan')
+  assert.match(planned.text, /UNDERSTAND > PLAN/)
 }
 
 async function toImplement(env: Env): Promise<void> {
@@ -228,7 +231,10 @@ describe('acceptance criteria at service level', () => {
 
     await advance(env, 'UNDERSTAND')
     await expectRefused(tool(env, 'advance', { to: 'IMPLEMENT', reason: 'skip ahead' }), /UNDERSTAND to IMPLEMENT/)
-    await advance(env, 'PLAN')
+    // CR10: planning starts when the person says so.
+    await expectRefused(tool(env, 'advance', { to: 'PLAN', reason: 'I think we are ready' }), /\/ewm plan/)
+    assert.equal((await taskOf(env)).phase, 'UNDERSTAND')
+    assert.match((await cmd(env, 'plan')).text, /UNDERSTAND > PLAN/)
     await expectRefused(tool(env, 'advance', { to: 'IMPLEMENT', reason: 'no plan yet' }), /at least one step/)
     assert.match((await cmd(env, 'approve')).text, /no steps/)
 
@@ -326,9 +332,9 @@ describe('acceptance criteria at service level', () => {
       rule: 'profile.models.search',
       at: new Date(await env.io.now()).toISOString(),
     })
-    assert.match((await cmd(env, 'status')).text, /haiku \(ewm:repo-scout x1\)/)
+    assert.match((await cmd(env, 'status')).text, /haiku \[claude-haiku-4-5-20251001\] \(ewm:repo-scout x1\)/)
     assert.ok((await auditKinds(env)).includes('agent_spawn'))
-    assert.deepEqual((await currentView(env.ctx))?.models, ['haiku (ewm:repo-scout x1)'])
+    assert.deepEqual((await currentView(env.ctx))?.models, ['haiku [claude-haiku-4-5-20251001] (ewm:repo-scout x1)'])
   })
 
   it('AC5 validates through the allowlist and hands off at DONE', async () => {
@@ -664,14 +670,24 @@ describe('commands', () => {
     await assert.rejects(activeContext(env.ctx), /ledger/)
   })
 
-  it('honours validation.commands from project.yaml, including arguments', async () => {
+  it('honours validation.commands from project.yaml: the exact entry, whitespace-normalized (CR11)', async () => {
     const env = setup({ '/repo/.ewm/project.yaml': PROJECT_YAML })
     await toValidate(env)
     const ledger = await loadLedger(env.io, ROOT)
     assert.deepEqual(ledger.tasks['TASK-001']?.profile.validation.commands, ['npm test'])
-    await expectOk(tool(env, 'run_validation', { command: 'npm   test -- --reporter dot' }))
-    assert.deepEqual(env.calls[0]?.argv, ['npm', 'test', '--', '--reporter', 'dot'])
-    assert.equal((await taskOf(env)).validations[0]?.command, 'npm test -- --reporter dot')
+    await expectOk(tool(env, 'run_validation', { command: '  npm   test ' }))
+    assert.deepEqual(env.calls[0]?.argv, ['npm', 'test'])
+    assert.equal((await taskOf(env)).validations[0]?.command, 'npm test')
+  })
+
+  it('refuses arguments after a listed command: a PASS must come from the command the person listed (CR11)', async () => {
+    const env = setup({ '/repo/.ewm/project.yaml': PROJECT_YAML })
+    await toValidate(env)
+    for (const command of ['npm test --help', 'npm test -- -t nothing', 'npm test --version', 'npm test -u']) {
+      await expectRefused(tool(env, 'run_validation', { command }), /not an allowed validation command/)
+    }
+    assert.equal(env.calls.length, 0, 'nothing ran')
+    assert.deepEqual((await taskOf(env)).validations, [])
   })
 
   it('without validation commands in the profile nothing can be run', async () => {
@@ -705,8 +721,11 @@ describe('tools', () => {
 
     await cmd(env, 'resume')
     await advance(env, 'EXPLORE')
-    const task = await taskOf(env)
-    await env.io.writeText(`${TASK_DIR}/task.json`, JSON.stringify({ ...task, phase: 'DONE' }))
+    // The phase is the ledger's (CR5): a DONE task that is still the active one.
+    const ledger = await loadLedger(env.io, ROOT)
+    const entry = ledger.tasks['TASK-001']
+    assert.ok(entry)
+    await saveLedger(env.io, ROOT, { ...ledger, tasks: { ...ledger.tasks, 'TASK-001': { ...entry, phase: 'DONE' } } })
     for (const spec of TOOL_SPECS) await expectRefused(tool(env, spec.name, MINIMAL_INPUT[spec.name]), /DONE/)
   })
 
@@ -752,7 +771,8 @@ describe('tools', () => {
   })
 
   async function toImplementFrom(env: Env): Promise<void> {
-    for (const to of ['EXPLORE', 'UNDERSTAND', 'PLAN']) await advance(env, to)
+    for (const to of ['EXPLORE', 'UNDERSTAND']) await advance(env, to)
+    await cmd(env, 'plan')
     await expectOk(tool(env, 'set_plan', PLAN_INPUT))
     await cmd(env, 'approve')
   }

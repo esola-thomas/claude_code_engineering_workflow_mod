@@ -31,7 +31,7 @@ test('AC4: a scout is routed to the profile search model and the spawn is record
     rule: 'profile.models.search',
   })
   const status = await h.ewm('status')
-  expect(status.text).toContain('haiku (ewm:repo-scout x1)')
+  expect(status.text).toContain('haiku [claude-haiku-4-5-20251001] (ewm:repo-scout x1)')
 
   // An explicit request for a stronger model does not override the profile (cost discipline).
   await h.spawn({ ...SCOUT, model: 'opus' })

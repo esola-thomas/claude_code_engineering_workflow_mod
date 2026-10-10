@@ -142,17 +142,30 @@ describe('summarizeModels', () => {
     assert.deepEqual(summarizeModels(uses), ['haiku (ewm:docs-scout x2, ewm:repo-scout x3)'])
   })
 
-  it('merges full ids and aliases of the same family', () => {
+  it('merges full ids and aliases of the same family, showing the resolved id (CR16)', () => {
     const uses = [use('ewm:repo-scout', 'claude-haiku-4-5-20251001'), use('ewm:repo-scout', 'haiku')]
-    assert.deepEqual(summarizeModels(uses), ['haiku (ewm:repo-scout x2)'])
+    assert.deepEqual(summarizeModels(uses), ['haiku [claude-haiku-4-5-20251001] (ewm:repo-scout x2)'])
   })
 
-  it('prefers routed_model over the resolved model', () => {
+  it('shows the resolved model id next to the family, as the engine reported it (CR16)', () => {
+    const uses = [use('ewm:repo-scout', 'claude-haiku-5-5', { routed_model: 'haiku' })]
+    assert.deepEqual(summarizeModels(uses), ['haiku [claude-haiku-5-5] (ewm:repo-scout x1)'])
+  })
+
+  it('lists several resolved ids of one family together', () => {
+    const uses = [use('ewm:repo-scout', 'claude-haiku-4-5', { routed_model: 'haiku' }), use('ewm:docs-scout', 'claude-haiku-5-5', { routed_model: 'haiku' })]
+    assert.deepEqual(summarizeModels(uses), ['haiku [claude-haiku-4-5, claude-haiku-5-5] (ewm:repo-scout x1, ewm:docs-scout x1)'])
+  })
+
+  it('reports the family the engine resolved, and flags that it differs from what the router asked for (CR16)', () => {
     const uses = [
       use('ewm:repo-scout', 'claude-opus-4-1', { routed_model: 'haiku' }),
       use('ewm:repo-scout', 'claude-haiku-4-5-20251001', { routed_model: 'haiku' }),
     ]
-    assert.deepEqual(summarizeModels(uses), ['haiku (ewm:repo-scout x2)'])
+    assert.deepEqual(summarizeModels(uses), [
+      'opus [claude-opus-4-1] (ewm:repo-scout x1) - asked for haiku',
+      'haiku [claude-haiku-4-5-20251001] (ewm:repo-scout x1)',
+    ])
   })
 
   it('falls back to the resolved model when routed_model is absent or empty', () => {

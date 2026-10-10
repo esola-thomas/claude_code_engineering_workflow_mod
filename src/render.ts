@@ -8,15 +8,24 @@
 
 import type { ActivePhase, Approval, Evidence, Finding, GateName, PaneModel, Phase, Profile, Question, Staleness, Task, TaskSummary, ValidationRun } from './types.ts'
 
-/** Computed by the caller (service): pendingGate/hasValidApproval on the trusted task, and summarizeModels(task.agent_usage). */
-export type GateState = { pending: GateName | null; planApproved: boolean; models: string[] }
+/** Computed by the caller (service): pendingGate/hasValidApproval on the trusted task, and summarizeModels(task.agent_usage).
+ *  `plan` is the plan the person is being asked to approve (set only while plan_approval is pending); hash is the full SHA-256. */
+export type GateState = { pending: GateName | null; planApproved: boolean; models: string[]; plan?: { hash: string; steps: number; summary: string } | null }
 
 // ---------------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------------
 
+/** ANSI escape sequences (CSI and OSC) and every other C0/C1 control character except \n and \t. Model-written text must not drive the terminal (CR16). */
+export function stripControls(text: string): string {
+  return text
+    .replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+}
+
 function oneLine(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
+  return stripControls(text.replace(/[\r\v\f]/g, ' ')).replace(/\s+/g, ' ').trim()
 }
 
 /** At most `max` whitespace-separated words, with "..." attached to the last one when cut. */
@@ -43,7 +52,7 @@ function heading(artifact: string, task: Task): string {
 
 /** Blocks separated by blank lines, ending with a single newline. */
 function document(...blocks: string[]): string {
-  return `${blocks.join('\n\n')}\n`
+  return `${stripControls(blocks.join('\n\n'))}\n`
 }
 
 function section(title: string, body: string): string {
@@ -146,17 +155,18 @@ function mapLinesOf(task: Task): string[] {
 /** counts.components = task.system_map.components.length (0 when null); sources = distinct evidence paths; risks = plan risks; stale = stale findings. map_lines = text_map lines (else components); question_lines = open questions "Q-001 text"; models = gate.models. */
 export function paneModel(task: Task, profile: Profile, gate: GateState): PaneModel {
   return {
-    project: profile.profile_id,
+    project: oneLine(profile.profile_id),
     task_id: task.id,
-    title: task.title,
+    title: oneLine(task.title),
     phase: task.phase,
     paused_from: task.paused_from,
     rail: railOf(task.phase, task.paused_from),
     counts: countsOf(task),
-    models: [...gate.models],
+    models: gate.models.map(oneLine),
     pending_gate: gate.pending,
-    next_action: task.next_action,
-    map_lines: mapLinesOf(task),
+    plan: gate.pending === 'plan_approval' && gate.plan != null ? { hash: gate.plan.hash, steps: gate.plan.steps, summary: oneLine(gate.plan.summary) } : null,
+    next_action: oneLine(task.next_action),
+    map_lines: mapLinesOf(task).map(stripControls),
     question_lines: openQuestions(task).map(question => `${question.id} ${oneLine(question.text)}`),
   }
 }
@@ -177,9 +187,15 @@ function modelLines(models: readonly string[]): string[] {
   ]
 }
 
+/** First characters of a plan hash: what the person is shown and can type back. */
+export function shortHash(hash: string): string {
+  return hash.slice(0, 8)
+}
+
 function gateLine(gate: GateState): string {
   if (gate.pending === 'plan_approval') {
-    return 'Gate: plan approval pending. Run /ewm approve to start building, or /ewm reject <reason> to revise the plan.'
+    const plan = gate.plan == null ? '' : ` (plan ${shortHash(gate.plan.hash)}, ${plural(gate.plan.steps, 'step')})`
+    return `Gate: plan approval pending${plan}. Run /ewm approve to start building, or /ewm reject <reason> to revise the plan.`
   }
   if (gate.pending === 'done_acceptance') {
     return 'Gate: final acceptance pending. Run /ewm approve to finish the task, or /ewm reject <reason> to keep working.'
@@ -301,7 +317,8 @@ export function renderDecisions(task: Task): string {
 }
 
 export function renderPlan(task: Task, gate: GateState): string {
-  const blocks = [heading('Plan', task), `Phase: ${task.phase} | Approval: ${gate.planApproved ? 'approved' : 'not approved'}`]
+  const hash = gate.plan == null ? '' : ` | Plan: ${shortHash(gate.plan.hash)}`
+  const blocks = [heading('Plan', task), `Phase: ${task.phase} | Approval: ${gate.planApproved ? 'approved' : 'not approved'}${hash}`]
   if (gate.pending === 'plan_approval') {
     blocks.push('Waiting for you: run /ewm approve to approve this plan, or /ewm reject <reason> to send it back.')
   }
@@ -388,8 +405,14 @@ export function renderHandoff(task: Task, changedFiles: readonly string[]): stri
   const steps = task.plan?.steps ?? []
   const stepsDone = steps.filter(step => step.status === 'done').length
   const passed = task.validations.filter(run => run.ok).length
+  const reviews = task.agent_usage.filter(use => use.agent_type === 'ewm:reviewer')
+  const review =
+    reviews.length === 0
+      ? 'Diff review: no ewm:reviewer run was recorded for this task'
+      : `Diff review: ewm:reviewer ran ${plural(reviews.length, 'time')} (last in ${reviews[reviews.length - 1]?.phase ?? 'unknown phase'})`
   const summary = [
     `Final phase: ${task.phase}`,
+    review,
     `Plan: ${task.plan === null || task.plan.summary.trim() === '' ? 'none recorded' : oneLine(task.plan.summary)}`,
     `Steps done: ${stepsDone} of ${steps.length}`,
     `Validation runs: ${task.validations.length} (${passed} passed)`,
@@ -430,17 +453,9 @@ const BRIEF_MAX_PATHS = 4
 
 const GATE_LABELS: Record<GateName, string> = { plan_approval: 'plan', done_acceptance: 'acceptance' }
 
-/** Gates whose latest record is an approval. A plan approval counts only while it matches the stored plan hash. */
-function approvedGates(task: Task): string[] {
-  const latest = new Map<GateName, Approval>()
-  for (const approval of task.approvals) latest.set(approval.gate, approval)
-  const labels: string[] = []
-  for (const [gate, approval] of latest) {
-    if (approval.decision !== 'approved') continue
-    const planChanged = gate === 'plan_approval' && task.plan !== null && approval.plan_hash !== undefined && approval.plan_hash !== task.plan.hash
-    if (!planChanged) labels.push(GATE_LABELS[gate])
-  }
-  return labels
+/** Gates the ledger says are approved now (CR16): the caller computes them on the trusted task with the plan hash recomputed. task.json's own approvals are never read. */
+function approvedGates(gate: GateState | undefined): string[] {
+  return gate !== undefined && gate.planApproved ? [GATE_LABELS.plan_approval] : []
 }
 
 function changeNote(staleness: Staleness): string {
@@ -491,9 +506,9 @@ function questionLines(task: Task): string[] {
 }
 
 /** Resume brief readable in <= 60 s: <= 180 words. Where we were (phase), approved decisions, open questions (max 5), stale evidence, next action. */
-export function renderResumeBrief(task: Task, staleness: Staleness): string {
+export function renderResumeBrief(task: Task, staleness: Staleness, gate?: GateState): string {
   const where = task.phase === 'PAUSED' ? `PAUSED${task.paused_from === null ? '' : ` (was ${task.paused_from})`}` : task.phase
-  const gates = approvedGates(task)
+  const gates = approvedGates(gate)
   return [
     `Resuming ${task.id}: ${clipWords(task.title, BRIEF_TITLE_WORDS)}`,
     `Where we were: ${where}`,

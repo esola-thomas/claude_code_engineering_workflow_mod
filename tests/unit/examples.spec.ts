@@ -94,6 +94,29 @@ describe('schemas/project.schema.json', () => {
   it('lists exactly the top-level Profile fields', () => {
     assert.deepEqual(propertyNames(readJsonObject(PROJECT_SCHEMA)), Object.keys(DEFAULT_PROFILE).sort())
   })
+
+  it('agrees with the lenient loader: no key is required and unknown keys are allowed (partial profiles are valid)', () => {
+    const walk = (node: unknown, path: string): void => {
+      if (!isObject(node)) return
+      assert.equal(node.required, undefined, `${path || 'root'} must not require keys: normalizeProfile fills the defaults`)
+      assert.notEqual(node.additionalProperties, false, `${path || 'root'} must allow unknown keys: normalizeProfile only warns about them`)
+      if (isObject(node.properties)) for (const [key, child] of Object.entries(node.properties)) walk(child, path === '' ? key : `${path}.${key}`)
+    }
+    walk(readJsonObject(PROJECT_SCHEMA), '')
+  })
+
+  it('declares the DEFAULT_PROFILE value as the default of every leaf', () => {
+    const check = (value: unknown, schema: unknown, path: string): void => {
+      assert.ok(isObject(schema), `${path}: schema node is missing`)
+      if (isObject(value)) {
+        assert.ok(isObject(schema.properties), `${path}: no properties`)
+        for (const [key, child] of Object.entries(value)) check(child, schema.properties[key], `${path}.${key}`)
+      } else {
+        assert.deepEqual(schema.default, value, `${path}: default does not match DEFAULT_PROFILE`)
+      }
+    }
+    check(DEFAULT_PROFILE, readJsonObject(PROJECT_SCHEMA), 'profile')
+  })
 })
 
 describe('schemas/task.schema.json', () => {
@@ -105,6 +128,12 @@ describe('schemas/task.schema.json', () => {
 
   it('declares every makeTask() key', () => {
     assertKeysDeclared(makeTask(), readJsonObject(TASK_SCHEMA), '')
+  })
+
+  it('declares the evidence fingerprint and describes the plan hash as SHA-256', () => {
+    const text = readRepoFile(TASK_SCHEMA)
+    assert.match(text, /"fingerprint"/)
+    assert.match(text, /SHA-256 \(64 hex digits\)/)
   })
 
   it('lists exactly the top-level Task fields', () => {

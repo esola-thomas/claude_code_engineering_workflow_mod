@@ -23,7 +23,7 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 | mcp__ewm__decision | For each decision or assumption the person states or confirms. `{title, choice, rationale}`. | Active task. |
 | mcp__ewm__write_map | When the explanation changes the map. `{mermaid, text_map, components[]}`. | `mermaid` is 1-20000 characters. |
 | mcp__ewm__set_intake | When the person changes the goal, criteria or constraints. Send the complete lists. | Phase INTAKE through PLAN. |
-| mcp__ewm__advance | `{to:'EXPLORE', reason}` or `{to:'PLAN', reason}`. | Phase UNDERSTAND. |
+| mcp__ewm__advance | `{to:'EXPLORE', reason}` when data is missing. | Phase UNDERSTAND. Moving to PLAN is refused for you: only the person starts planning, with `/ewm plan`. |
 
 ## Steps
 
@@ -66,5 +66,5 @@ After at most `max_research_rounds_without_user_update` research rounds (default
 ## Exit
 
 - Data is missing: call mcp__ewm__advance with `{to:'EXPLORE', reason:'<what to find>'}` and tell the person what you will look for.
-- The person says they are ready: call mcp__ewm__advance with `{to:'PLAN', reason:'person ready'}`, or let them run /ewm plan.
-- Do not advance to PLAN on your own judgment. When the explanation is complete, ask "Ready to plan?" and wait.
+- The person is the one who decides they are ready to plan, by running `/ewm plan`. When the explanation is complete and the assumptions are confirmed, ask "Ready to plan? Run `/ewm plan` when you are." and wait.
+- mcp__ewm__advance to PLAN is refused for you (the mod only accepts it from the person). Do not retry it: the mod starts the plan stage itself when they run /ewm plan.

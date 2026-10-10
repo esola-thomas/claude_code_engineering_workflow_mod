@@ -43,7 +43,7 @@ export type Harness = {
   /** Fires session.start with the repo root as cwd. */
   start(): Promise<void>
   /** Runs `/ewm <args>` as typed in the composer (or another origin). */
-  ewm(args: string, origin?: { kind: 'composer' | 'bridge' | 'sdk' } | { kind: 'plugin'; name: string }): Promise<{ text?: string; context?: readonly string[] }>
+  ewm(args: string, origin?: { kind: 'composer' | 'bridge' | 'sdk' | 'scheduled-trigger' | 'task-notification' } | { kind: 'plugin'; name: string }): Promise<{ text?: string; context?: readonly string[] }>
   /** Spawns a subagent through the engine (`$.agent.spawn`); the kit fills in the fields the engine stamps. */
   spawn(input: { subagentType: string; prompt: string; description: string; model?: string }): Promise<{ model?: string; agentId?: string; deny?: string }>
   /** Raises a tool call as a subagent's loop would (the event carries its agentId). */
@@ -53,7 +53,7 @@ export type Harness = {
   task(): Task
   /** The gate ledger the mod keeps in $.store. */
   ledger(): Ledger
-  /** Moves the task through the phases with the model's own `advance` tool. */
+  /** Moves the task through the phases with the model's own `advance` tool (UNDERSTAND > PLAN goes through `/ewm plan`, as only the person may do it). */
   advanceTo(...phases: string[]): Promise<void>
 }
 
@@ -211,6 +211,12 @@ export function createHarness($: Engine, on: On, options: HarnessOptions = {}): 
     },
     async advanceTo(...phases) {
       for (const to of phases) {
+        // CR10: UNDERSTAND > PLAN is the person's call, so it goes through /ewm plan.
+        if (to === 'PLAN' && harness.task().phase === 'UNDERSTAND') {
+          const planned = await harness.ewm('plan')
+          if (!(planned.text ?? '').includes('UNDERSTAND > PLAN')) throw new Error(`/ewm plan failed: ${planned.text}`)
+          continue
+        }
         const out = await harness.tool('advance', { to, reason: `moving to ${to}` })
         if (out.isError) throw new Error(`advance to ${to} failed: ${out.text}`)
       }

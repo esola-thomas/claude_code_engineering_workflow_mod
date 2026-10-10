@@ -1,17 +1,17 @@
 # System map - TASK-001: Find why average() returns the wrong value
 
-Updated: 2026-10-09T23:30:37.823Z
+Updated: 2026-10-10T00:54:47.232Z
 
 ## Text map
 
 ```text
-average.js -> calls sum.js for the addition, then divides by length
-sum.js: loop starts at i=1, so numbers[0] is skipped (root cause)
-test/average.test.js and test/sum.test.js both call into this code
-docs/DESIGN.md: sum must include the first element; average*length == sum
-README.md: documents the modules and npm test
-package.json: npm test = node --test test/*.test.js
+average.js -> calls sum.js (mean = sum / length; empty list returns 0)
+sum.js: loop starts at i=1, skips first element (root cause)
 format.js: independent, presentation only
+test/average.test.js and test/sum.test.js: expect correct values, currently failing
+package.json: npm test runs node --test test/*.test.js
+docs/DESIGN.md: invariants say sum includes every element
+README.md: describes modules and npm test
 ```
 
 ## Components
@@ -21,20 +21,20 @@ format.js: independent, presentation only
 - src/format.js
 - test/average.test.js
 - test/sum.test.js
+- package.json
 - docs/DESIGN.md
 - README.md
-- package.json
 
 ## Diagram
 
 ```mermaid
 flowchart LR
-  Test_avg["test/average.test.js"] -->|calls| Avg["src/average.js"]
-  Avg -->|calls| Sum["src/sum.js (loop starts at i=1: BUG)"]
-  Test_sum["test/sum.test.js"] -->|calls| Sum
-  Design["docs/DESIGN.md"] -->|specifies invariants of| Sum
+  AvgTest["test/average.test.js"] -->|calls| Avg["src/average.js"]
+  SumTest["test/sum.test.js"] -->|calls| Sum["src/sum.js (bug: loop from i=1)"]
+  Avg -->|calls| Sum
+  Fmt["src/format.js"] -.->|independent| Avg
+  Pkg["package.json npm test"] -->|runs| AvgTest
+  Pkg -->|runs| SumTest
+  Design["docs/DESIGN.md"] -->|specifies| Sum
   Readme["README.md"] -->|describes| Avg
-  Pkg["package.json npm test"] -->|runs| Test_avg
-  Pkg -->|runs| Test_sum
-  Fmt["src/format.js"]
 ```

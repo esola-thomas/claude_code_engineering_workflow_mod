@@ -18,7 +18,7 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 | Tool | When | Precondition |
 |---|---|---|
 | mcp__ewm__status | At the start; it lists the success criteria and plan steps. | Active task. |
-| mcp__ewm__run_validation | To run a check. `{command}`. The mod runs it itself, without a shell, in the repository root, with the profile timeout, and records exit code, duration, commit and the output tail. | Only in VALIDATE. The command must equal one of the profile's `validation.commands`, or start with one followed by a space. No pipes, redirects, quotes, `&&`, `$` or backticks. |
+| mcp__ewm__run_validation | To run a check. `{command}`. The mod runs it itself, without a shell, in the repository root, with the profile timeout, and records exit code, duration, commit and the output tail. | Only in VALIDATE. The command must equal one of the profile's `validation.commands` exactly (whitespace aside): extra arguments are refused, so `npm test --help` is not `npm test`. No pipes, redirects, quotes, `&&`, `$` or backticks; put a compound command in a package script and list that. |
 | mcp__ewm__update_step | To fix a plan step's status. `{id, status}`. | Only in IMPLEMENT or VALIDATE. |
 | mcp__ewm__record_finding | For a verified fact, such as a failure cause. Evidence rules as in EXPLORE. | Active task. |
 | mcp__ewm__question / mcp__ewm__decision | For open items and for choices the person makes. | Active task. |
@@ -27,8 +27,8 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 ## Steps
 
 1. Call mcp__ewm__status. Read `.ewm/project.yaml` for `validation.commands`. If the list is empty, tell the person that nothing can be validated until they add commands there and run /ewm resume.
-2. Review the change first: `git diff --stat` and `git diff <base_commit>`. If `ewm:reviewer` has not reviewed this diff, ask it now (give the base commit, the plan summary and N).
-3. Run every relevant command with mcp__ewm__run_validation, one at a time. Only these runs count toward closure. A command you run through Bash is not recorded. Re-run after any code change; an old result does not vouch for new code.
+2. Review the change first: `git diff --stat` and `git diff <base_commit>`. IMPLEMENT should already have shown the diff to the person and had `ewm:reviewer` review it. If it did not (check decisions.md and the status models line), say so to the person and ask the reviewer now (give the base commit, the plan summary and N). State in your report whether a diff review happened; handoff.md records it.
+3. Run every relevant command with mcp__ewm__run_validation, one at a time. Only these runs count toward closure, and only a run that passed since the task last entered VALIDATE: a failed run, or a pass from before you went back to IMPLEMENT, does not let the person accept. A command you run through Bash is not recorded. Re-run after any code change; an old result does not vouch for new code.
 4. Report in a table: command, exit code, ok or failed, duration. Quote the relevant output tail for failures.
 5. Map each success criterion to its evidence: a validation run (V-001), a test, a diff hunk or a finding. State which criteria are met, which are not, and the gaps: checks not run, behavior not covered by tests, environment limits, flaky results.
 6. Set the plan step statuses with mcp__ewm__update_step so they match reality.
@@ -65,7 +65,7 @@ Never call a criterion met without a recorded run or a cited line behind it. A p
 - In VALIDATE only read tools, read-only Bash, validation commands and the mcp__ewm__* tools work. Edit and Write are denied.
 - Never edit `.ewm/` files directly, including validation.md. mcp__ewm__run_validation writes it.
 - Destructive commands and, by default, network tools are denied.
-- Gates need a human. You have no approve tool; do not run /ewm commands or invoke the `ewm` skill. Do not call mcp__ewm__advance with `to:'DONE'`; it fails without the person's acceptance, which also needs at least one recorded validation run.
+- Gates need a human. You have no approve tool; do not run /ewm commands or invoke the `ewm` skill. Do not call mcp__ewm__advance with `to:'DONE'`; it fails without the person's acceptance, which also needs at least one passing validation run recorded since the task entered VALIDATE.
 - Follow any "ewm: " denial message instead of working around it.
 
 ## Updating the person

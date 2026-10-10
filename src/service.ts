@@ -23,18 +23,20 @@ import {
   renderSystemMap,
   renderTaskList,
   renderValidation,
+  shortHash,
 } from './render.ts'
 import type { GateState } from './render.ts'
 import { summarizeModels } from './router.ts'
 import {
   EWM_DIR,
   appendAudit,
+  createLedgerEntry,
   createTask,
   ensureWorkspace,
   joinPath,
   listTasks,
   loadLedger,
-  loadTask,
+  loadTaskRecovering,
   nextTaskId,
   redactSecrets,
   saveLedger,
@@ -73,8 +75,9 @@ export type Ctx = { io: Io; root: string } // root is absolute
 
 type Input = Record<string, unknown>
 
-/** The active task as the ledger names it, with the profile snapshot the guard and tools must use. */
-type Active = { ledger: Ledger; task: Task; profile: Profile }
+/** The active task as the ledger names it, with the profile snapshot the guard and tools must use.
+ *  `task.phase` and `task.paused_from` are the ledger's (CR5), whatever task.json says. `recovered` is set when task.json was unreadable and task.json.bak stood in (CR13). */
+type Active = { ledger: Ledger; task: Task; profile: Profile; recovered?: boolean }
 
 // ---------------------------------------------------------------------------
 // Serialized writes
@@ -132,7 +135,14 @@ function nextId(prefix: string, ids: readonly string[], pad: number): string {
   return `${prefix}-${String(highest + 1).padStart(pad, '0')}`
 }
 
-const NO_ACTIVE_TASK_HELP = 'ewm: there is no active task. Ask the person to run /ewm new "<title>" or /ewm resume.'
+/** Who reads an error: the model (via a tool) is told to ask the person; the person (via a command) is told what to type. */
+type Audience = 'model' | 'person'
+
+function noActiveTaskHelp(audience: Audience): string {
+  return audience === 'person'
+    ? 'ewm: there is no active task. Run /ewm new "<title>" or /ewm resume.'
+    : 'ewm: there is no active task. Ask the person to run /ewm new "<title>" or /ewm resume.'
+}
 
 // ---------------------------------------------------------------------------
 // Git (read-only, always with cwd = root)
@@ -155,53 +165,62 @@ async function gitLine(ctx: Ctx, ...args: string[]): Promise<string | null> {
   return line === undefined || line === '' ? null : line
 }
 
-/** Undoes git's C-style quoting of unusual path names. */
-function unquoteGitPath(path: string): string {
-  if (path.length < 2 || !path.startsWith('"') || !path.endsWith('"')) return path
-  return path.slice(1, -1).replace(/\\(["\\])/g, '$1')
-}
+/** Git prints non-ASCII paths as octal escapes unless told otherwise (CR14); every call that returns paths also uses -z. */
+const GIT_RAW_PATHS = ['-c', 'core.quotepath=off'] as const
 
 function isWorkflowState(path: string): boolean {
   return path === EWM_DIR || path.startsWith(`${EWM_DIR}/`)
 }
 
+/** Paths from `-z` output (NUL separated, never quoted), without workflow state. */
 function pathList(stdout: string): string[] {
-  return stdout
-    .split('\n')
-    .map(line => unquoteGitPath(line.trim()))
-    .filter(path => path !== '' && !isWorkflowState(path))
+  return stdout.split('\0').filter(path => path !== '' && !isWorkflowState(path))
 }
 
-/** Paths changed between `commit` and HEAD, relative to root; null when git cannot tell. */
+/** Paths changed between `commit` and HEAD, relative to root, both sides of a rename; null when git cannot tell. */
 async function changedSince(ctx: Ctx, commit: string): Promise<string[] | null> {
   if (!COMMIT_PATTERN.test(commit)) return null
-  const out = await git(ctx, 'diff', '--name-only', '--relative', commit, 'HEAD')
+  const out = await git(ctx, ...GIT_RAW_PATHS, 'diff', '--name-only', '--no-renames', '-z', '--relative', commit, 'HEAD')
   return out === null ? null : pathList(out)
 }
 
-/** Paths git reports as modified, added, renamed (new name) or untracked, relative to root; null when git cannot tell. */
+/** Paths git reports as modified, added, renamed (both the old and the new name), deleted or untracked, relative to root; null when git cannot tell. */
 async function worktreeChanges(ctx: Ctx): Promise<string[] | null> {
-  const out = await git(ctx, 'status', '--porcelain')
+  const out = await git(ctx, ...GIT_RAW_PATHS, 'status', '--porcelain', '-z')
   if (out === null) return null
   // Porcelain paths are relative to the repository top level; root may be a subdirectory.
   const prefix = (await git(ctx, 'rev-parse', '--show-prefix'))?.trim() ?? ''
+  const fields = out.split('\0')
   const paths: string[] = []
-  for (const line of out.split('\n')) {
-    if (line.length < 4) continue
-    let path = line.slice(3)
-    const arrow = path.indexOf(' -> ')
-    if (arrow !== -1) path = path.slice(arrow + 4)
-    path = unquoteGitPath(path)
-    if (!path.startsWith(prefix)) continue // outside root
-    path = path.slice(prefix.length)
-    if (path !== '' && !isWorkflowState(path)) paths.push(path)
+  const keep = (path: string): void => {
+    if (!path.startsWith(prefix)) return // outside root
+    const relative = path.slice(prefix.length)
+    if (relative !== '' && !isWorkflowState(relative)) paths.push(relative)
+  }
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i] ?? ''
+    if (field.length < 4) continue
+    keep(field.slice(3))
+    // A rename or copy is followed by its original path as a field of its own.
+    if (field.charAt(0) === 'R' || field.charAt(0) === 'C' || field.charAt(1) === 'R' || field.charAt(1) === 'C') {
+      i++
+      keep(fields[i] ?? '')
+    }
   }
   return paths
 }
 
-/** Whether `path` is among the changed paths (a changed directory such as "src/new/" covers what is inside it). */
+/** Whether `path` is among the changed paths (a changed directory such as "src/new/" covers what is inside it, and an evidence directory is changed by files beneath it). */
 function isChanged(path: string, changed: readonly string[]): boolean {
-  return changed.some(entry => entry === path || (entry.endsWith('/') && path.startsWith(entry)))
+  return changed.some(entry => entry === path || (entry.endsWith('/') && path.startsWith(entry)) || entry.startsWith(`${path}/`))
+}
+
+const BLOB_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/
+
+/** `git hash-object` of the working-tree file, or null for a directory, a missing file or no git. */
+async function fingerprintOf(ctx: Ctx, path: string): Promise<string | null> {
+  const out = await gitLine(ctx, 'hash-object', '--', path)
+  return out !== null && BLOB_ID.test(out) ? out : null
 }
 
 /** Files changed since the task's base commit (committed and uncommitted), sorted, without workflow state. */
@@ -217,8 +236,10 @@ async function changedFilesOf(ctx: Ctx, task: Task): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * Marks findings whose evidence file changed since it was verified. Never re-runs validations or
- * any other side effect. When git cannot answer, nothing is marked and `checked` is false.
+ * Marks findings whose evidence changed since it was verified. Evidence recorded with a fingerprint is compared by content, so a
+ * file that was already dirty when the finding was recorded is not stale until it changes again; other evidence is stale when
+ * git lists its path as changed (committed since the verified commit, or uncommitted). Never re-runs validations or any other
+ * side effect. When git cannot answer, nothing is marked and `checked` is false.
  */
 async function checkStaleness(ctx: Ctx, task: Task): Promise<{ staleness: Staleness; task: Task }> {
   const previous = { branch: task.repo.branch, commit: task.repo.base_commit }
@@ -240,8 +261,17 @@ async function checkStaleness(ctx: Ctx, task: Task): Promise<{ staleness: Stalen
   const stale = new Set<string>()
   for (const finding of fresh) {
     const committed = changedByBase.get(baseOf(finding)) ?? null
-    // A commit git cannot diff against cannot vouch for the evidence either.
-    const touched = committed === null || finding.evidence.some(item => isChanged(item.path, [...committed, ...dirty]))
+    let touched = false
+    for (const item of finding.evidence) {
+      const now = item.fingerprint === undefined ? null : await fingerprintOf(ctx, item.path)
+      if (now !== null) {
+        touched = now !== item.fingerprint
+      } else {
+        // A commit git cannot diff against cannot vouch for the evidence either.
+        touched = committed === null || isChanged(item.path, [...committed, ...dirty])
+      }
+      if (touched) break
+    }
     if (touched) stale.add(finding.id)
   }
   const changedPaths = unique([...[...changedByBase.values()].flatMap(paths => paths ?? []), ...dirty]).sort()
@@ -266,44 +296,58 @@ function profileOf(ledger: Ledger, id: string): Profile {
   return ledger.tasks[id]?.profile ?? DEFAULT_PROFILE
 }
 
+/** The task with the phase and resume target the ledger holds (CR5); task.json's own copies are a mirror the model could have edited. */
+function withLedgerPhase(task: Task, ledger: Ledger): Task {
+  const entry = ledger.tasks[task.id]
+  return entry === undefined ? task : { ...task, phase: entry.phase, paused_from: entry.paused_from }
+}
+
 /** The active task per the ledger, or null when none is active. Throws when the ledger or the task is unreadable. */
 async function loadActive(ctx: Ctx): Promise<Active | null> {
   const ledger = await loadLedger(ctx.io, ctx.root)
   if (ledger.active_task === null) return null
-  const task = await loadTask(ctx.io, ctx.root, ledger.active_task)
-  return { ledger, task, profile: profileOf(ledger, task.id) }
+  const { task, recovered } = await loadTaskRecovering(ctx.io, ctx.root, ledger.active_task)
+  const active: Active = { ledger, task: withLedgerPhase(task, ledger), profile: profileOf(ledger, task.id) }
+  if (recovered) active.recovered = true
+  return active
 }
 
-async function requireActive(ctx: Ctx): Promise<Active> {
+async function requireActive(ctx: Ctx, audience: Audience): Promise<Active> {
   const active = await loadActive(ctx)
-  if (active === null) throw new EwmError('no_active_task', NO_ACTIVE_TASK_HELP)
+  if (active === null) throw new EwmError('no_active_task', noActiveTaskHelp(audience))
   return active
 }
 
 /** The active task, which must be neither PAUSED nor DONE. */
-async function requireRunning(ctx: Ctx): Promise<Active> {
-  const active = await requireActive(ctx)
+async function requireRunning(ctx: Ctx, audience: Audience = 'model'): Promise<Active> {
+  const active = await requireActive(ctx, audience)
   const { task } = active
+  const ask = audience === 'person' ? 'Run' : 'Ask the person to run'
   if (task.phase === 'PAUSED') {
-    throw new EwmError('invalid_transition', `ewm: ${task.id} is paused, so the workflow tools are off. Ask the person to run /ewm resume ${task.id}.`)
+    throw new EwmError('invalid_transition', `ewm: ${task.id} is paused, so the workflow tools are off. ${ask} /ewm resume ${task.id}.`)
   }
   if (task.phase === 'DONE') {
-    throw new EwmError('invalid_transition', `ewm: ${task.id} is DONE. Ask the person to run /ewm new "<title>" to start another task.`)
+    throw new EwmError('invalid_transition', `ewm: ${task.id} is DONE. ${ask} /ewm new "<title>" to start another task.`)
   }
   return active
 }
 
-/** What the controller sees: approvals and validations from the ledger only. */
+/** What the controller sees: phase, approvals and validations from the ledger only. */
 function trustedOf(task: Task, ledger: Ledger): Task {
   return trustedTask(task, ledger.tasks[task.id])
 }
 
 function gateOf(task: Task, ledger: Ledger, profile: Profile): GateState {
   const trusted = trustedOf(task, ledger)
+  const pending = pendingGate(trusted, profile)
   return {
-    pending: pendingGate(trusted, profile),
+    pending,
     planApproved: hasValidApproval(trusted, 'plan_approval'),
     models: summarizeModels(task.agent_usage),
+    plan:
+      pending === 'plan_approval' && trusted.plan !== null
+        ? { hash: planHash(trusted.plan), steps: trusted.plan.steps.length, summary: trusted.plan.summary }
+        : null,
   }
 }
 
@@ -317,7 +361,7 @@ function fromTrusted(original: Task, computed: Task): Task {
 }
 
 // ---------------------------------------------------------------------------
-// Persisting a mutation: save task (+ ledger), re-render artifacts, append audit
+// Persisting a mutation: ledger first, then task.json, artifacts and audit
 // ---------------------------------------------------------------------------
 
 const STATE_ARTIFACTS: readonly ArtifactName[] = ARTIFACT_NAMES.filter(name => name !== 'handoff.md')
@@ -333,6 +377,9 @@ type PersistOptions = {
   changedFiles?: readonly string[]
   audit?: readonly AuditDraft[]
 }
+
+/** The ledger the mutation ends with (its phase mirrors the saved task) and the task as saved. */
+type Saved = { task: Task; ledger: Ledger }
 
 function renderArtifact(name: ArtifactName, task: Task, gate: GateState, changedFiles: readonly string[]): string {
   switch (name) {
@@ -353,37 +400,67 @@ function renderArtifact(name: ArtifactName, task: Task, gate: GateState, changed
   }
 }
 
-/** Saves the task (listing the artifacts it now has), stores a changed ledger, re-renders `artifacts` and appends the audit lines. */
-async function persist(ctx: Ctx, view: { ledger: Ledger; profile: Profile }, task: Task, options: PersistOptions): Promise<Task> {
+/**
+ * Stores a mutation. The ledger is the authority, so it goes first and carries the saved phase and resume target (CR5);
+ * then task.json (listing the artifacts it now has); then the re-rendered artifacts and the audit lines. Artifacts and audit
+ * are best effort (CR13): a failure there is never reported as a failed mutation, because the state is already stored, and
+ * the next transition or resume re-renders every artifact.
+ */
+async function commitState(ctx: Ctx, view: { ledger: Ledger; profile: Profile; recovered?: boolean }, task: Task, options: PersistOptions): Promise<Saved> {
   const { io, root } = ctx
   const names = options.artifacts ?? []
   const present = new Set([...task.artifacts, ...names])
   const saved: Task = { ...task, artifacts: ARTIFACT_NAMES.filter(name => present.has(name)) }
+
+  let ledger = options.ledger ?? view.ledger
+  const entry = ledger.tasks[saved.id]
+  let ledgerChanged = options.ledger !== undefined
+  if (entry !== undefined && (entry.phase !== saved.phase || entry.paused_from !== saved.paused_from)) {
+    ledger = { ...ledger, tasks: { ...ledger.tasks, [saved.id]: { ...entry, phase: saved.phase, paused_from: saved.paused_from } } }
+    ledgerChanged = true
+  }
+  if (ledgerChanged) await saveLedger(io, root, ledger)
   await saveTask(io, root, saved)
-  if (options.ledger !== undefined) await saveLedger(io, root, options.ledger)
-  const gate = gateOf(saved, options.ledger ?? view.ledger, view.profile)
-  for (const name of names) {
-    await writeArtifact(io, root, saved.id, name, renderArtifact(name, saved, gate, options.changedFiles ?? []))
+
+  const drafts: AuditDraft[] = [
+    ...(view.recovered === true ? [{ kind: 'error' as const, detail: 'task.json was unreadable; the task was restored from task.json.bak' }] : []),
+    ...(options.audit ?? []),
+  ]
+  try {
+    const gate = gateOf(saved, ledger, view.profile)
+    for (const name of names) {
+      await writeArtifact(io, root, saved.id, name, renderArtifact(name, saved, gate, options.changedFiles ?? []))
+    }
+  } catch (error) {
+    drafts.push({ kind: 'error', detail: `an artifact could not be written (${errorText(error)}); it is re-rendered on the next transition or resume` })
   }
-  for (const draft of options.audit ?? []) {
-    const entry: AuditEntry = { at: options.at, kind: draft.kind, phase: saved.phase, detail: draft.detail }
-    if (draft.tool !== undefined) entry.tool = draft.tool
-    if (draft.commit !== undefined) entry.commit = draft.commit
-    await appendAudit(io, root, saved.id, entry)
+  for (const draft of drafts) {
+    const item: AuditEntry = { at: options.at, kind: draft.kind, phase: saved.phase, detail: draft.detail }
+    if (draft.tool !== undefined) item.tool = draft.tool
+    if (draft.commit !== undefined) item.commit = draft.commit
+    try {
+      await appendAudit(io, root, saved.id, item)
+    } catch {
+      // The audit log never fails a mutation (CR13).
+    }
   }
-  return saved
+  return { task: saved, ledger }
+}
+
+async function persist(ctx: Ctx, view: { ledger: Ledger; profile: Profile; recovered?: boolean }, task: Task, options: PersistOptions): Promise<Task> {
+  return (await commitState(ctx, view, task, options)).task
 }
 
 // ---------------------------------------------------------------------------
 // Phase moves shared by commands and tools
 // ---------------------------------------------------------------------------
 
-async function moveTo(ctx: Ctx, active: Active, to: Phase, actor: 'user' | 'model', reason: string, at: string): Promise<Task> {
+async function moveTo(ctx: Ctx, active: Active, to: Phase, actor: 'user' | 'model', reason: string, at: string): Promise<Saved> {
   const { task, profile } = active
   const moved = transition(trustedOf(task, active.ledger), to, actor, reason, at, profile)
-  return persist(ctx, active, fromTrusted(task, moved), {
+  return commitState(ctx, active, fromTrusted(task, moved), {
     at,
-    artifacts: ['decisions.md', 'plan.md'],
+    artifacts: STATE_ARTIFACTS,
     audit: [{ kind: 'transition', detail: `${task.phase} -> ${to} by ${actor}: ${reason}` }],
   })
 }
@@ -408,22 +485,23 @@ function skillFor(phase: Phase): string {
   }
 }
 
-/** Pauses the ledger's active task when it is running and is not `keepId`; says what it did. A task that cannot be read is left alone. */
-async function pauseOther(ctx: Ctx, ledger: Ledger, keepId: string | null, at: string): Promise<string | null> {
+/** Pauses the ledger's active task when it is running and is not `keepId`; says what it did and returns the ledger as it now stands. A task that cannot be read is left alone. */
+async function pauseOther(ctx: Ctx, ledger: Ledger, keepId: string | null, at: string): Promise<{ note: string | null; ledger: Ledger }> {
   const otherId = ledger.active_task
-  if (otherId === null || otherId === keepId) return null
+  if (otherId === null || otherId === keepId) return { note: null, ledger }
   try {
-    const other = await loadTask(ctx.io, ctx.root, otherId)
-    if (other.phase === 'PAUSED' || other.phase === 'DONE') return null
+    const { task: loaded, recovered } = await loadTaskRecovering(ctx.io, ctx.root, otherId)
+    const other = withLedgerPhase(loaded, ledger)
+    if (other.phase === 'PAUSED' || other.phase === 'DONE') return { note: null, ledger }
     const paused = pause(other, at, `paused: the person started or resumed another task`)
-    await persist(ctx, { ledger, profile: profileOf(ledger, otherId) }, paused, {
+    const saved = await commitState(ctx, { ledger, profile: profileOf(ledger, otherId), recovered }, paused, {
       at,
-      artifacts: ['decisions.md'],
+      artifacts: STATE_ARTIFACTS,
       audit: [{ kind: 'pause', detail: `paused from ${other.phase}: another task became active` }],
     })
-    return `Paused ${otherId} (was in ${other.phase}); resume it later with /ewm resume ${otherId}.`
+    return { note: `Paused ${otherId} (was in ${other.phase}); resume it later with /ewm resume ${otherId}.`, ledger: saved.ledger }
   } catch (error) {
-    return `Could not pause ${otherId} (${errorText(error)}); it was left untouched.`
+    return { note: `Could not pause ${otherId} (${errorText(error)}); it was left untouched.`, ledger }
   }
 }
 
@@ -441,15 +519,58 @@ function warningLines(warnings: readonly string[]): string[] {
   return warnings.length === 0 ? [] : ['Profile warnings:', ...warnings.map(warning => `  - ${warning}`)]
 }
 
+/** Shell syntax that run_validation never accepts (CR11): the command runs without a shell, so these could only be a mistake or an attack. */
+const VALIDATION_SHELL_SYNTAX = /[|&;<>$`\\"'\r\n]/
+
+/** Why a command can never run as a validation, or null when it can. The command is whitespace-normalized by the caller. */
+function validationRefusal(command: string, profile: Profile): string | null {
+  if (VALIDATION_SHELL_SYNTAX.test(command)) {
+    return 'it contains shell syntax (| & ; < > $ ` quotes or a backslash) and validation commands run without a shell; put compound commands in a package script and list that'
+  }
+  const kind = classifyBash(command, profile)
+  if (kind === 'destructive') return 'it is classified as destructive'
+  if (kind === 'network') return 'it uses the network'
+  return null
+}
+
+/** Profile entries run_validation can never run, as warnings the person sees when the profile is (re)loaded. */
+function validationWarnings(profile: Profile): string[] {
+  const warnings: string[] = []
+  for (const entry of profile.validation.commands) {
+    const reason = validationRefusal(oneLine(entry), profile)
+    if (reason !== null) warnings.push(`validation.commands entry "${entry}" can never run: ${reason}.`)
+  }
+  return warnings
+}
+
+function leafValues(value: unknown, path: string, out: Record<string, string>): void {
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    for (const [key, child] of Object.entries(value)) leafValues(child, path === '' ? key : `${path}.${key}`, out)
+  } else {
+    out[path] = JSON.stringify(value)
+  }
+}
+
+/** The profile fields whose value differs between two snapshots, as "policies.external_network: "deny_by_default" -> "allow"". */
+function profileChanges(before: Profile, after: Profile): string[] {
+  const was: Record<string, string> = {}
+  const now: Record<string, string> = {}
+  leafValues(before, '', was)
+  leafValues(after, '', now)
+  return unique([...Object.keys(was), ...Object.keys(now)])
+    .filter(key => was[key] !== now[key])
+    .map(key => `${key}: ${was[key] ?? '(unset)'} -> ${now[key] ?? '(unset)'}`)
+}
+
 async function cmdNew(ctx: Ctx, command: Extract<EwmCommand, { name: 'new' }>): Promise<CommandOutput> {
   const { io, root } = ctx
   await ensureWorkspace(io, root)
   const { profile, source, warnings } = await loadProfile(io, root)
-  const ledger = await loadLedger(io, root)
+  const loaded = await loadLedger(io, root)
   const at = await nowIso(io)
-  const pausedNote = await pauseOther(ctx, ledger, null, at)
+  const { note: pausedNote, ledger } = await pauseOther(ctx, loaded, null, at)
 
-  const id = await nextTaskId(io, root)
+  const id = await nextTaskId(io, root, ledger)
   const branch = await gitLine(ctx, 'rev-parse', '--abbrev-ref', 'HEAD')
   const baseCommit = await gitLine(ctx, 'rev-parse', 'HEAD')
   const goal = command.goal ?? command.title
@@ -462,9 +583,9 @@ async function cmdNew(ctx: Ctx, command: Extract<EwmCommand, { name: 'new' }>): 
     at,
     next_action: defaultNextAction('INTAKE'),
   })
-  const withEntry = updateLedgerEntry(ledger, id, entry => entry, { profile, profile_source: source })
-  const nextLedger: Ledger = { ...withEntry, active_task: id }
-  const saved = await persist(ctx, { ledger: nextLedger, profile }, task, {
+  // CR7: a new task never inherits approvals, validations or a profile snapshot from an earlier entry for the same id.
+  const nextLedger: Ledger = { ...ledger, active_task: id, tasks: { ...ledger.tasks, [id]: createLedgerEntry({ profile, profile_source: source }) } }
+  const saved = await commitState(ctx, { ledger: nextLedger, profile }, task, {
     at,
     ledger: nextLedger,
     artifacts: STATE_ARTIFACTS,
@@ -473,9 +594,9 @@ async function cmdNew(ctx: Ctx, command: Extract<EwmCommand, { name: 'new' }>): 
   const text = [
     `Started ${id}: ${command.title}`,
     ...(pausedNote === null ? [] : [pausedNote]),
-    ...warningLines(warnings),
+    ...warningLines([...warnings, ...validationWarnings(profile)]),
     '',
-    statusOf(saved, nextLedger, profile),
+    statusOf(saved.task, saved.ledger, profile),
   ].join('\n')
   return {
     text,
@@ -497,33 +618,46 @@ async function defaultResumeId(ctx: Ctx, ledger: Ledger): Promise<string> {
 
 async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume' }>): Promise<CommandOutput> {
   const { io, root } = ctx
-  const ledger = await loadLedger(io, root)
-  const id = command.id ?? (await defaultResumeId(ctx, ledger))
-  const loaded = await loadTask(io, root, id)
-  if (loaded.phase === 'DONE') {
+  const loadedLedger = await loadLedger(io, root)
+  const id = command.id ?? (await defaultResumeId(ctx, loadedLedger))
+  const { task: raw, recovered } = await loadTaskRecovering(io, root, id)
+  // CR5: phase, resume target, approvals and validations come from the ledger; task.json is only a mirror.
+  const known = loadedLedger.tasks[id]
+  const trusted = trustedTask(raw, known)
+  if (trusted.phase === 'DONE') {
     throw invalid(`${id} is DONE, so there is nothing to resume. Its handoff is in ${EWM_DIR}/tasks/${id}/handoff.md; start a new task with /ewm new.`)
   }
   const { profile, source, warnings } = await loadProfile(io, root)
   const at = await nowIso(io)
-  const pausedNote = await pauseOther(ctx, ledger, id, at)
+  const { note: pausedNote, ledger } = await pauseOther(ctx, loadedLedger, id, at)
 
-  const { staleness, task: checked } = await checkStaleness(ctx, loaded)
-  const resumed = { ...resume(checked, at), updated_at: at }
+  const { staleness, task: checked } = await checkStaleness(ctx, trusted)
+  const resumed = { ...resume(checked, at, profile), updated_at: at }
   // Humans reload the profile here; the guard and tools use this snapshot until the next resume.
-  const withEntry = updateLedgerEntry(ledger, id, entry => ({ ...entry, profile, profile_source: source }), { profile, profile_source: source })
+  const withEntry = updateLedgerEntry(
+    ledger,
+    id,
+    entry => ({ ...entry, phase: trusted.phase, paused_from: trusted.paused_from, profile, profile_source: source }),
+    { profile, profile_source: source },
+  )
   const nextLedger: Ledger = { ...withEntry, active_task: id }
-  const saved = await persist(ctx, { ledger: nextLedger, profile }, resumed, {
+  const saved = await commitState(ctx, { ledger: nextLedger, profile, recovered }, fromTrusted(raw, resumed), {
     at,
     ledger: nextLedger,
     artifacts: STATE_ARTIFACTS,
     audit: [{ kind: 'resume', detail: `resumed in ${resumed.phase}; ${staleness.checked ? `${staleness.stale_findings.length} finding(s) newly stale` : 'staleness not checked'}` }],
   })
-  const brief = renderResumeBrief(saved, staleness)
-  const text = [brief, ...(pausedNote === null ? [] : ['', pausedNote]), ...warningLines(warnings)].join('\n')
+  const brief = renderResumeBrief(saved.task, staleness, gateOf(saved.task, saved.ledger, profile))
+  const changes = known === undefined ? [] : profileChanges(known.profile, profile)
+  const profileNotice =
+    changes.length === 0
+      ? []
+      : ['', 'The project profile changed since the last snapshot and applies from now on:', ...changes.map(change => `  - ${change}`), 'If you did not edit .ewm/project.yaml yourself, check it before continuing.']
+  const text = [brief, ...(pausedNote === null ? [] : ['', pausedNote]), ...profileNotice, ...warningLines([...warnings, ...validationWarnings(profile)])].join('\n')
   return {
     text,
     context: [brief, 'Do not repeat side-effecting operations; re-verify stale evidence before relying on it.'],
-    kickoff: `Continue ${id} in ${saved.phase}: load the skill ${skillFor(saved.phase)} and pick up from the resume brief.`,
+    kickoff: `Continue ${id} in ${saved.task.phase}: load the skill ${skillFor(saved.task.phase)} and pick up from the resume brief.`,
     changed: true,
     openPane: true,
   }
@@ -563,7 +697,7 @@ async function cmdPlan(ctx: Ctx): Promise<CommandOutput> {
       const at = await nowIso(ctx.io)
       const moved = await moveTo(ctx, active, 'PLAN', 'user', 'the person asked to plan', at)
       return {
-        text: `${task.id} moved UNDERSTAND > PLAN.\n\n${statusOf(moved, ledger, profile)}`,
+        text: `${task.id} moved UNDERSTAND > PLAN.\n\n${statusOf(moved.task, moved.ledger, profile)}`,
         kickoff: `The person is ready to plan ${task.id}. Load the skill ${skillFor('PLAN')} and write the plan.`,
         changed: true,
         openPane: true,
@@ -582,8 +716,11 @@ async function cmdPause(ctx: Ctx): Promise<CommandOutput> {
   const id = ledger.active_task
   if (id === null) throw new EwmError('no_active_task', 'ewm: there is no active task to pause.')
   let task: Task
+  let recovered = false
   try {
-    task = await loadTask(io, root, id)
+    const loaded = await loadTaskRecovering(io, root, id)
+    task = withLedgerPhase(loaded.task, ledger)
+    recovered = loaded.recovered
   } catch (error) {
     await saveLedger(io, root, { ...ledger, active_task: null })
     return {
@@ -594,9 +731,9 @@ async function cmdPause(ctx: Ctx): Promise<CommandOutput> {
   const at = await nowIso(io)
   const profile = profileOf(ledger, id)
   const paused = pause(task, at, 'paused by the person')
-  await persist(ctx, { ledger, profile }, paused, {
+  await commitState(ctx, { ledger, profile, recovered }, paused, {
     at,
-    artifacts: ['decisions.md'],
+    artifacts: STATE_ARTIFACTS,
     audit: [{ kind: 'pause', detail: `paused from ${task.phase}` }],
   })
   return {
@@ -617,16 +754,35 @@ function noGateError(trusted: Task, profile: Profile, decision: 'approved' | 're
   }
   const verb = decision === 'approved' ? 'approve' : 'reject'
   return invalid(
-    `nothing to ${verb} in ${trusted.phase}. A gate opens in PLAN once the plan has steps (plan approval) and in VALIDATE once a validation has run (final acceptance).`,
+    `nothing to ${verb} in ${trusted.phase}. A gate opens in PLAN once the plan has steps (plan approval) and in VALIDATE once a validation has passed (final acceptance).`,
   )
 }
 
-async function cmdDecide(ctx: Ctx, via: Via, decision: 'approved' | 'rejected', note: string | undefined): Promise<CommandOutput> {
-  const active = await requireRunning(ctx)
+/** "hash 6ec3494e, 2 steps, updated <time>": what the person approves, echoed back so they can see which plan it was. */
+function describePlan(plan: Plan): string {
+  return `hash ${shortHash(planHash(plan))}, ${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}, updated ${plan.updated_at}`
+}
+
+async function cmdDecide(
+  ctx: Ctx,
+  via: Via,
+  decision: 'approved' | 'rejected',
+  note: string | undefined,
+  reviewedPlan: string | undefined,
+): Promise<CommandOutput> {
+  const active = await requireRunning(ctx, 'person')
   const { task, ledger, profile } = active
   const trusted = trustedOf(task, ledger)
   const gate = pendingGate(trusted, profile)
   if (gate === null) throw noGateError(trusted, profile, decision)
+  if (decision === 'approved' && gate === 'plan_approval' && reviewedPlan !== undefined && trusted.plan !== null) {
+    const current = planHash(trusted.plan)
+    if (!current.startsWith(reviewedPlan.toLowerCase())) {
+      throw invalid(
+        `the plan changed after you reviewed it (you approved ${reviewedPlan.slice(0, 8)}; it is now ${describePlan(trusted.plan)}). Nothing was approved: read it with /ewm plan, then approve again.`,
+      )
+    }
+  }
 
   const at = await nowIso(ctx.io)
   const withApproval = recordApproval(trusted, gate, decision, via, at, profile, note)
@@ -636,11 +792,11 @@ async function cmdDecide(ctx: Ctx, via: Via, decision: 'approved' | 'rejected', 
   const recorded: Task = { ...task, approvals: [...task.approvals, approval], updated_at: at }
   const approvalAudit: AuditDraft = {
     kind: 'approval',
-    detail: `${gate} ${decision} via ${via}${note === undefined || note === '' ? '' : `: ${note}`}`,
+    detail: `${gate} ${decision} via ${via}${trusted.plan !== null && gate === 'plan_approval' ? ` (${describePlan(trusted.plan)})` : ''}${note === undefined || note === '' ? '' : `: ${note}`}`,
   }
 
   if (decision === 'rejected') {
-    const saved = await persist(ctx, { ledger: withEntry, profile }, recorded, {
+    const saved = await persist(ctx, { ledger: withEntry, profile, recovered: active.recovered === true }, recorded, {
       at,
       ledger: withEntry,
       artifacts: ['decisions.md', 'plan.md'],
@@ -662,17 +818,19 @@ async function cmdDecide(ctx: Ctx, via: Via, decision: 'approved' | 'rejected', 
   const to: Phase = gate === 'plan_approval' ? 'IMPLEMENT' : 'DONE'
   const moved = fromTrusted(recorded, transition(withApproval, to, 'user', `${gate} approved`, at, profile))
   const transitionAudit: AuditDraft = { kind: 'transition', detail: `${task.phase} -> ${to} by user: ${gate} approved` }
+  const view = { profile, recovered: active.recovered === true }
 
   if (to === 'IMPLEMENT') {
-    const saved = await persist(ctx, { ledger: withEntry, profile }, moved, {
+    const saved = await commitState(ctx, { ledger: withEntry, ...view }, moved, {
       at,
       ledger: withEntry,
-      artifacts: ['decisions.md', 'plan.md'],
+      artifacts: STATE_ARTIFACTS,
       audit: [approvalAudit, transitionAudit],
     })
+    const echo = trusted.plan === null ? '' : ` (${describePlan(trusted.plan)})`
     return {
-      text: `Plan approved. ${saved.id} moves to IMPLEMENT.\n\n${statusOf(saved, withEntry, profile)}`,
-      kickoff: `The person approved the plan for ${saved.id}. Load the skill ${skillFor('IMPLEMENT')} and implement it step by step.`,
+      text: `Plan approved${echo}. ${saved.task.id} moves to IMPLEMENT.\n\n${statusOf(saved.task, saved.ledger, profile)}`,
+      kickoff: `The person approved the plan for ${saved.task.id}. Load the skill ${skillFor('IMPLEMENT')} and implement it step by step.`,
       changed: true,
       openPane: true,
     }
@@ -680,10 +838,10 @@ async function cmdDecide(ctx: Ctx, via: Via, decision: 'approved' | 'rejected', 
 
   const changedFiles = await changedFilesOf(ctx, moved)
   const finished: Ledger = { ...withEntry, active_task: null }
-  const saved = await persist(ctx, { ledger: finished, profile }, moved, {
+  const saved = await persist(ctx, { ledger: finished, ...view }, moved, {
     at,
     ledger: finished,
-    artifacts: ['decisions.md', 'plan.md', 'handoff.md'],
+    artifacts: [...STATE_ARTIFACTS, 'handoff.md'],
     changedFiles,
     audit: [approvalAudit, transitionAudit],
   })
@@ -724,9 +882,9 @@ async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via): Promise
     case 'pause':
       return cmdPause(ctx)
     case 'approve':
-      return cmdDecide(ctx, via, 'approved', command.note)
+      return cmdDecide(ctx, via, 'approved', command.note, command.plan)
     case 'reject':
-      return cmdDecide(ctx, via, 'rejected', command.note)
+      return cmdDecide(ctx, via, 'rejected', command.note, undefined)
     case 'list':
       return cmdList(ctx)
     case 'help':
@@ -804,6 +962,17 @@ function requirePhase(tool: string, task: Task, allowed: readonly Phase[]): void
 
 type ToolHandler = (ctx: Ctx, active: Active, input: Input, at: string) => Promise<ToolOutput>
 
+/** CR3: a model-tool write leaves a 'tool_effect' audit line with the tool and a one-line summary (redacted when appended). */
+function effect(tool: string, summary: string): AuditDraft {
+  return { kind: 'tool_effect', tool, detail: snippet(summary, 160) }
+}
+
+/** The first `max` characters of text on one line, with "..." when cut. */
+function snippet(text: string, max = 80): string {
+  const line = oneLine(text)
+  return line.length <= max ? line : `${line.slice(0, max)}...`
+}
+
 function done(text: string): ToolOutput {
   return { ok: true, text, changed: true }
 }
@@ -834,7 +1003,11 @@ async function toolSetIntake(ctx: Ctx, active: Active, input: Input, at: string)
   if (input.constraints === undefined) throw invalid(`${tool}: "constraints" is required; pass [] for none.`)
   const constraints = stringList(tool, input, 'constraints', 0, 20)
   const next: Task = { ...task, goal: goal ?? task.goal, success_criteria: successCriteria, constraints, updated_at: at }
-  await persist(ctx, active, next, { at, artifacts: ['decisions.md'] })
+  await persist(ctx, active, next, {
+    at,
+    artifacts: ['decisions.md'],
+    audit: [effect(tool, `intake saved: ${successCriteria.length} success criteria, ${constraints.length} constraints`)],
+  })
   return done(`Intake saved for ${task.id}: ${successCriteria.length} success criteria, ${constraints.length} constraints.`)
 }
 
@@ -845,7 +1018,7 @@ async function toolAdvance(ctx: Ctx, active: Active, input: Input, at: string): 
   const { task, profile } = active
   const check = checkTransition(trustedOf(task, active.ledger), to, 'model', profile)
   if (!check.ok) return { ok: false, text: check.reason, changed: false }
-  const moved = await moveTo(ctx, active, to, 'model', reason, at)
+  const { task: moved } = await moveTo(ctx, active, to, 'model', reason, at)
   return done(`${task.id} moved ${task.phase} > ${moved.phase}. Next: ${moved.next_action}`)
 }
 
@@ -905,6 +1078,8 @@ async function checkEvidence(ctx: Ctx, raw: Input, index: number): Promise<Evide
     if (last > lines) throw invalid(`record_finding: ${label} cites line ${last} but ${path} has ${lines} lines.`)
   }
   const evidence: Evidence = { path }
+  const fingerprint = await fingerprintOf(ctx, path)
+  if (fingerprint !== null) evidence.fingerprint = fingerprint
   if (lineStart !== undefined) evidence.line_start = lineStart
   if (lineEnd !== undefined) evidence.line_end = lineEnd
   const docId = optionalString('record_finding', raw, 'doc_id', 200)
@@ -942,8 +1117,12 @@ async function toolRecordFinding(ctx: Ctx, active: Active, input: Input, at: str
     recorded_at: at,
   }
   const findings = existing === undefined ? [...task.findings, finding] : task.findings.map(item => (item.id === existing.id ? finding : item))
-  await persist(ctx, active, { ...task, findings, updated_at: at }, { at, artifacts: ['exploration.md'] })
   const verb = existing === undefined ? 'Recorded' : 'Updated'
+  await persist(ctx, active, { ...task, findings, updated_at: at }, {
+    at,
+    artifacts: ['exploration.md'],
+    audit: [effect(tool, `${finding.id} ${verb.toLowerCase()}: ${snippet(claim)}`)],
+  })
   return done(`${verb} ${finding.id} (${confidence}, ${evidence.length} evidence item(s)). ${task.id} now has ${findings.length} finding(s).`)
 }
 
@@ -958,7 +1137,11 @@ async function toolQuestion(ctx: Ctx, active: Active, input: Input, at: string):
     const duplicate = task.open_questions.find(question => question.status === 'open' && claimKey(question.text) === claimKey(text))
     if (duplicate !== undefined) return { ok: true, text: `Already open as ${duplicate.id}; nothing added.`, changed: false }
     const question: Question = { id: nextId('Q', task.open_questions.map(item => item.id), 3), text, status: 'open', raised_at: at }
-    await persist(ctx, active, { ...task, open_questions: [...task.open_questions, question], updated_at: at }, { at, artifacts: ['questions.md'] })
+    await persist(ctx, active, { ...task, open_questions: [...task.open_questions, question], updated_at: at }, {
+      at,
+      artifacts: ['questions.md'],
+      audit: [effect(tool, `${question.id} added: ${snippet(text)}`)],
+    })
     return done(`Added ${question.id}.`)
   }
   const id = requireString(tool, input, 'id', 20)
@@ -971,7 +1154,11 @@ async function toolQuestion(ctx: Ctx, active: Active, input: Input, at: string):
   if (target.status === 'resolved') throw invalid(`question: ${id} is already resolved.`)
   const resolved: Question = { ...target, status: 'resolved', answer, resolved_at: at }
   const open_questions = task.open_questions.map(question => (question.id === id ? resolved : question))
-  await persist(ctx, active, { ...task, open_questions, updated_at: at }, { at, artifacts: ['questions.md'] })
+  await persist(ctx, active, { ...task, open_questions, updated_at: at }, {
+    at,
+    artifacts: ['questions.md'],
+    audit: [effect(tool, `${id} resolved: ${snippet(answer)}`)],
+  })
   return done(`Resolved ${id}.`)
 }
 
@@ -987,7 +1174,11 @@ async function toolDecision(ctx: Ctx, active: Active, input: Input, at: string):
     decided_by: 'model',
     at,
   }
-  await persist(ctx, active, { ...task, decisions: [...task.decisions, decision], updated_at: at }, { at, artifacts: ['decisions.md'] })
+  await persist(ctx, active, { ...task, decisions: [...task.decisions, decision], updated_at: at }, {
+    at,
+    artifacts: ['decisions.md'],
+    audit: [effect(tool, `${decision.id} recorded: ${snippet(decision.title)}`)],
+  })
   return done(`Recorded ${decision.id}: ${decision.title}.`)
 }
 
@@ -1012,13 +1203,17 @@ async function toolSetPlan(ctx: Ctx, active: Active, input: Input, at: string): 
     alternatives: stringList(tool, input, 'alternatives', 0, 30),
   }
   const plan: Plan = { ...content, hash: planHash(content), updated_at: at }
-  const saved = await persist(ctx, active, { ...task, plan, updated_at: at }, { at, artifacts: ['plan.md'] })
+  const saved = await persist(ctx, active, { ...task, plan, updated_at: at }, {
+    at,
+    artifacts: ['plan.md'],
+    audit: [effect(tool, `plan saved: ${steps.length} step(s), hash ${shortHash(plan.hash)}: ${snippet(summary, 60)}`)],
+  })
   const gate = gateOf(saved, active.ledger, active.profile)
   const next =
     gate.pending === 'plan_approval'
       ? 'Present the plan to the person and ask them to run /ewm approve (a changed plan needs a new approval).'
       : 'Present the plan to the person.'
-  return done(`Plan saved with ${steps.length} step(s) (hash ${plan.hash}). ${next}`)
+  return done(`Plan saved with ${steps.length} step(s) (hash ${shortHash(plan.hash)}). ${next}`)
 }
 
 async function toolUpdateStep(ctx: Ctx, active: Active, input: Input, at: string): Promise<ToolOutput> {
@@ -1033,7 +1228,11 @@ async function toolUpdateStep(ctx: Ctx, active: Active, input: Input, at: string
     throw invalid(`update_step: step ${id} does not exist. Steps: ${plan.steps.map(step => step.id).join(', ')}.`)
   }
   const steps = plan.steps.map(step => (step.id === id ? { ...step, status } : step))
-  await persist(ctx, active, { ...task, plan: { ...plan, steps, updated_at: at }, updated_at: at }, { at, artifacts: ['plan.md'] })
+  await persist(ctx, active, { ...task, plan: { ...plan, steps, updated_at: at }, updated_at: at }, {
+    at,
+    artifacts: ['plan.md'],
+    audit: [effect(tool, `${id} -> ${status}`)],
+  })
   return done(`${id} is now ${status}.`)
 }
 
@@ -1046,7 +1245,11 @@ async function toolWriteMap(ctx: Ctx, active: Active, input: Input, at: string):
   const textMap = requireString(tool, input, 'text_map', 20000)
   const components = stringList(tool, input, 'components', 0, 100, 200)
   const system_map = { mermaid, text_map: textMap, components, updated_at: at }
-  await persist(ctx, active, { ...task, system_map, updated_at: at }, { at, artifacts: ['system-map.md'] })
+  await persist(ctx, active, { ...task, system_map, updated_at: at }, {
+    at,
+    artifacts: ['system-map.md'],
+    audit: [effect(tool, `system map saved: ${components.length} component(s)`)],
+  })
   return done(`System map saved with ${components.length} component(s) to ${EWM_DIR}/tasks/${task.id}/system-map.md.`)
 }
 
@@ -1057,23 +1260,27 @@ const REPORTED_TAIL_CHARS = 1500
 
 type PreparedRun = { taskId: string; command: string; argv: string[]; timeoutMs: number }
 
-/** First locked step: check the phase and the allowlist. Nothing is run here. */
+/** First locked step: check the phase and the allowlist. Nothing is run here.
+ *  CR11: the command, whitespace-normalized, must equal a profile.validation.commands entry exactly, with no shell syntax, and not be destructive or network. */
 async function prepareValidation(ctx: Ctx, input: Input): Promise<PreparedRun> {
   const tool = 'run_validation'
   const { task, profile } = await requireRunning(ctx)
   requirePhase(tool, task, ['VALIDATE'])
   const command = requireString(tool, input, 'command', 1000)
-  if (classifyBash(command, profile) !== 'validation') {
-    const allowed = profile.validation.commands
+  const normalized = oneLine(command)
+  const allowed = profile.validation.commands
+  const listed = allowed.some(entry => oneLine(entry) === normalized)
+  const refusal = listed ? validationRefusal(normalized, profile) : null
+  if (!listed || refusal !== null) {
     throw invalid(
-      `run_validation: "${command}" is not an allowed validation command. Allowed (exactly, optionally followed by plain arguments, no shell syntax): ${
+      `run_validation: "${command}" is not an allowed validation command${refusal === null ? '' : ` (${refusal})`}. Allowed (the exact text, no extra arguments, no shell syntax): ${
         allowed.length === 0 ? 'none configured' : allowed.map(item => `"${item}"`).join(', ')
       }. To add one, ask the person to list it under validation.commands in ${EWM_DIR}/project.yaml and run /ewm resume.`,
     )
   }
-  const argv = splitArgs(command)
+  const argv = splitArgs(normalized)
   if (argv.length === 0) throw invalid('run_validation: "command" is empty.')
-  return { taskId: task.id, command: oneLine(command), argv, timeoutMs: profile.validation.timeout_ms }
+  return { taskId: task.id, command: normalized, argv, timeoutMs: profile.validation.timeout_ms }
 }
 
 /** Runs the command without holding the write queue: a long test run must not block other hooks. */
@@ -1107,7 +1314,8 @@ async function recordValidation(ctx: Ctx, prepared: PreparedRun, result: { exitC
   const ids = [...task.validations.map(run => run.id), ...(ledger.tasks[task.id]?.validations.map(run => run.id) ?? [])]
   const run: ValidationRun = {
     id: nextId('V', ids, 3),
-    command: prepared.command,
+    // The command is a profile entry, but the profile is not secret-free (a token in an argument); redact like the output.
+    command: redactSecrets(prepared.command),
     exit_code: result.exitCode,
     ok: result.exitCode === 0,
     duration_ms: result.durationMs,
@@ -1129,8 +1337,9 @@ async function recordValidation(ctx: Ctx, prepared: PreparedRun, result: { exitC
     audit: [{ kind: 'validation_run', detail: `${run.id} "${run.command}" exit ${run.exit_code}`, tool: 'run_validation', commit }],
   })
   const gate = gateOf(saved, nextLedger, profile)
-  const guidance =
-    gate.pending === 'done_acceptance'
+  const guidance = !run.ok
+    ? 'This run failed, so the person cannot accept yet. Report the failure, fix it in IMPLEMENT (mcp__ewm__advance to IMPLEMENT), then return to VALIDATE and run it again.'
+    : gate.pending === 'done_acceptance'
       ? 'Summarize the results for the person and ask them to run /ewm approve to accept, or fix the problems in IMPLEMENT.'
       : ''
   const shown = tail(run.output_tail, REPORTED_TAIL_CHARS)
@@ -1194,8 +1403,9 @@ export const TOOL_SPECS: readonly { name: string; description: string; inputSche
   {
     name: 'advance',
     description:
-      'Moves the task to the next workflow phase. Allowed edges: INTAKE>EXPLORE, EXPLORE>UNDERSTAND, UNDERSTAND>EXPLORE|PLAN, PLAN>UNDERSTAND|IMPLEMENT, IMPLEMENT>VALIDATE, VALIDATE>IMPLEMENT|PLAN|DONE. ' +
-      'PLAN>IMPLEMENT needs a plan with steps and, per the profile, the person\'s approval of that exact plan; VALIDATE>DONE needs a validation run and the person\'s acceptance. ' +
+      'Moves the task to the next workflow phase. Allowed edges: INTAKE>EXPLORE, EXPLORE>UNDERSTAND, UNDERSTAND>EXPLORE, PLAN>UNDERSTAND|IMPLEMENT, IMPLEMENT>VALIDATE, VALIDATE>IMPLEMENT|PLAN|DONE. ' +
+      'UNDERSTAND>PLAN is the person\'s call: ask whether they are ready and let them run /ewm plan (this tool refuses it). ' +
+      'PLAN>IMPLEMENT needs a plan with steps and, per the profile, the person\'s approval of that exact plan; VALIDATE>DONE needs a passing validation run since entering VALIDATE and the person\'s acceptance. ' +
       'You cannot approve for the person: when a gate blocks you, this tool says so; ask the person to run /ewm approve and wait.',
     inputSchema: {
       type: 'object',
@@ -1341,8 +1551,8 @@ export const TOOL_SPECS: readonly { name: string; description: string; inputSche
     name: 'run_validation',
     description:
       'Runs one validation command and records its exit code and output tail as evidence for the final acceptance. Only in VALIDATE. ' +
-      'The command must be one of the profile\'s validation.commands (exact, optionally followed by plain arguments; no pipes, redirects, quotes or other shell syntax). It runs without a shell in the repository root. ' +
-      'Run it yourself with this tool: runs made any other way do not count. When it passes, ask the person to run /ewm approve.',
+      'The command must equal one of the profile\'s validation.commands exactly (extra arguments are refused; no pipes, redirects, quotes or other shell syntax). It runs without a shell in the repository root. ' +
+      'Run it yourself with this tool: runs made any other way do not count. Only a passing run recorded since the task entered VALIDATE lets the person accept: when it passes, ask them to run /ewm approve; when it fails, fix it in IMPLEMENT and run it again.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1448,7 +1658,11 @@ export async function recordDenial(ctx: Ctx, tool: string, reason: string): Prom
     const active = await loadActive(ctx)
     if (active === null) return
     const at = await nowIso(ctx.io)
-    await appendAudit(ctx.io, ctx.root, active.task.id, { at, kind: 'tool_denied', phase: active.task.phase, detail: reason, tool })
+    try {
+      await appendAudit(ctx.io, ctx.root, active.task.id, { at, kind: 'tool_denied', phase: active.task.phase, detail: reason, tool })
+    } catch {
+      // The audit log never fails a mutation (CR13), and a denial is already delivered to the model.
+    }
   })
 }
 
@@ -1467,5 +1681,6 @@ export async function statusLine(ctx: Ctx): Promise<string | null> {
   const open = task.open_questions.filter(question => question.status === 'open').length
   const parts = [`ewm ${task.id}`, task.phase]
   if (open > 0) parts.push(`${open} open question${open === 1 ? '' : 's'}`)
+  if (pendingGate(trustedOf(task, active.ledger), active.profile) !== null) parts.push('awaiting /ewm approve')
   return parts.join(' · ')
 }

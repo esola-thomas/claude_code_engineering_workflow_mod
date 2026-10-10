@@ -109,18 +109,27 @@ export function createMemoryIo(initial: Record<string, string> = {}, startMs = D
 
 /**
  * A run handler that answers git the way a clean repo at `commit` on `branch` would,
- * with `changed` listing paths reported by `git diff --name-only <x> HEAD`
- * and `dirty` listing paths reported by `git status --porcelain`.
+ * with `changed` listing paths reported by `git diff --name-only <x> HEAD`,
+ * `dirty` listing paths reported by `git status --porcelain` and `hashes` mapping
+ * working-tree paths to the blob id `git hash-object` prints (other paths fail like a missing file).
+ * Leading `-c k=v` options are ignored and `-z` switches the output to NUL-separated paths, as the service asks for.
  */
-export function fakeGit(state: { branch: string; commit: string; changed?: string[]; dirty?: string[] }): RunHandler {
+export function fakeGit(state: { branch: string; commit: string; changed?: string[]; dirty?: string[]; hashes?: Record<string, string> }): RunHandler {
   return argv => {
     if (argv[0] !== 'git') return { exitCode: 127, stdout: '', stderr: 'command not found' }
-    const sub = argv.slice(1).join(' ')
+    let args = argv.slice(1)
+    while (args[0] === '-c') args = args.slice(2)
+    const sub = args.join(' ')
+    const separator = args.includes('-z') ? '\0' : '\n'
+    const lines = (items: string[]): string => items.map(item => item + separator).join('')
     if (sub === 'rev-parse --abbrev-ref HEAD') return { exitCode: 0, stdout: state.branch + '\n', stderr: '' }
     if (sub === 'rev-parse HEAD') return { exitCode: 0, stdout: state.commit + '\n', stderr: '' }
-    if (sub.startsWith('diff --name-only')) return { exitCode: 0, stdout: (state.changed ?? []).join('\n') + '\n', stderr: '' }
-    if (sub.startsWith('status --porcelain'))
-      return { exitCode: 0, stdout: (state.dirty ?? []).map(p => ` M ${p}`).join('\n') + '\n', stderr: '' }
+    if (sub.startsWith('diff --name-only')) return { exitCode: 0, stdout: lines(state.changed ?? []), stderr: '' }
+    if (sub.startsWith('status --porcelain')) return { exitCode: 0, stdout: lines((state.dirty ?? []).map(p => ` M ${p}`)), stderr: '' }
+    if (args[0] === 'hash-object') {
+      const hash = state.hashes?.[args[args.length - 1] ?? '']
+      return hash === undefined ? { exitCode: 128, stdout: '', stderr: 'fatal: could not open file' } : { exitCode: 0, stdout: hash + '\n', stderr: '' }
+    }
     return { exitCode: 0, stdout: '', stderr: '' }
   }
 }

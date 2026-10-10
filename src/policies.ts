@@ -33,10 +33,15 @@ export const SAFE_TOOLS: readonly string[] = Object.freeze([
   'TaskGet',
   'TaskList',
   'TaskUpdate',
+  'TaskOutput',
+  'TaskStop',
   'EnterPlanMode',
   'ExitPlanMode',
   'ListAgents',
 ])
+
+/** Read-only network tools: denied under deny_by_default (rule 8), allowed in every active phase under external_network: allow (CR2). */
+export const NETWORK_READ_TOOLS: readonly string[] = Object.freeze(['WebFetch', 'WebSearch'])
 
 /** Tools that send data out of the machine; denied under external_network: deny_by_default. */
 export const OUTBOUND_TOOLS: readonly string[] = Object.freeze([
@@ -77,6 +82,22 @@ export const NETWORK_PROGRAMS: readonly string[] = Object.freeze([
   'telnet',
   'ftp',
   'socat',
+  // CR18: more programs that talk to the network.
+  'ping',
+  'dig',
+  'nslookup',
+  'host',
+  'whois',
+  'traceroute',
+  'mtr',
+  'tftp',
+  'lftp',
+  'aria2c',
+  'http',
+  'https',
+  'gh',
+  'ssh-keyscan',
+  'ssh-copy-id',
 ])
 
 // ---------------------------------------------------------------------------
@@ -95,6 +116,10 @@ type Scan = {
   opaque: boolean
   /** Lines of heredoc bodies. A heredoc can feed a shell, so each line is also checked as a command. */
   heredocLines: string[]
+  /** Every word of every command, redirection targets included (quotes and escapes removed). */
+  allWords: string[]
+  /** The words that contained an unquoted glob character or `{`: they can expand to names the text does not show. */
+  globWords: string[]
   /** An unquoted glob with no directory in front of it (`*`, `*.ts`, `?x`): it can expand to a file named like an option. */
   leadingGlob: boolean
 }
@@ -170,6 +195,8 @@ class ListScanner {
   private quoted = false
   /** The word has an unquoted `{`: a later `,` or `..` makes it a brace expansion, which turns one word into several. */
   private braceOpen = false
+  /** The word has an unquoted glob character or `{`. */
+  private globbed = false
   /** Set after a redirection operator: the next word is its target, not an argument. */
   private redirection: Redirection | null = null
   private heredocs: PendingHeredoc[] = []
@@ -244,6 +271,7 @@ class ListScanner {
           break
         case '{':
           this.braceOpen = true
+          this.globbed = true
           this.append(ch, false)
           this.pos++
           break
@@ -257,6 +285,7 @@ class ListScanner {
         case '*':
         case '?':
         case '[':
+          this.globbed = true
           if (!(this.word ?? '').includes('/')) this.out.leadingGlob = true
           this.append(ch, false)
           this.pos++
@@ -293,6 +322,9 @@ class ListScanner {
     this.word = null
     this.quoted = false
     this.braceOpen = false
+    this.out.allWords.push(text)
+    if (this.globbed) this.out.globWords.push(text)
+    this.globbed = false
     const redirection = this.redirection
     if (redirection === null) {
       this.words.push(text)
@@ -495,7 +527,7 @@ class ListScanner {
 
 /** Null only when substitutions nest too deep to follow. */
 function scanCommand(src: string): Scan | null {
-  const out: Scan = { segments: [], opaque: false, heredocLines: [], leadingGlob: false }
+  const out: Scan = { segments: [], opaque: false, heredocLines: [], leadingGlob: false, allWords: [], globWords: [] }
   try {
     new ListScanner(src, 0, 0, false, out).run()
   } catch (error) {
@@ -613,6 +645,10 @@ const MAX_SHELL_DEPTH = 3
 const MAX_UNWRAP_HOPS = 16
 
 const EWM_MENTION = /\.ewm/i
+const EWM_NAME = '.ewm'
+/** Pieces of the name that a variable can be assigned to build it (`d=.e; ${d}wm`). A single character is too common a value to count. */
+const EWM_FRAGMENTS = new Set(['.e', '.ew', 'ew', 'ewm', 'wm'])
+const MAX_BRACE_ALTERNATIVES = 64
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/
 const SHELL_KEYWORDS = new Set([
   '!', '{', '}', 'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', 'for', 'select', 'function', 'coproc',
@@ -621,7 +657,9 @@ const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
 const SHELL_LONG_OPTIONS_WITH_VALUE = ['--rcfile', '--init-file']
 const FIND_EXEC_OPTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir'])
 const WHOLE_TREE_PATHSPECS = new Set(['.', './', ':/'])
-const NETWORK_GIT_SUBCOMMANDS = new Set(['fetch', 'pull', 'clone', 'ls-remote'])
+const NETWORK_GIT_SUBCOMMANDS = new Set([
+  'fetch', 'pull', 'clone', 'ls-remote', 'fetch-pack', 'send-pack', 'http-fetch', 'http-push', 'imap-send', 'send-email', 'svn',
+])
 
 /** Wrappers that run the rest of the words as a command. */
 const WRAPPERS = new Map<string, OptionSpec>([
@@ -642,6 +680,143 @@ const WRAPPERS = new Map<string, OptionSpec>([
     },
   ],
 ])
+
+// ---- the name `.ewm` built at run time ---------------------------------------
+//
+// A text match for `.ewm` is not enough: `.e*m`, `.e?m`, `.{e,x}wm`, `.e""wm`, `${d}wm` and `'.e'+'wm'` all name the folder without
+// writing it. Whatever builds the name from a glob, an expansion, a quote split or a string concatenation counts as mentioning it
+// (best effort: a script written to a file and run later still evades it; the gate ledger keeps the gates intact regardless, D14).
+
+/** `{a,b}` and `{a..c}` expanded the way the shell would, capped; text without a brace group comes back as it is. */
+function expandBraces(text: string): string[] {
+  const open = text.indexOf('{')
+  if (open < 0) return [text]
+  let depth = 0
+  let close = -1
+  const commas: number[] = []
+  for (let i = open; i < text.length; i++) {
+    const ch = text.charAt(i)
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) {
+        close = i
+        break
+      }
+    } else if (ch === ',' && depth === 1) commas.push(i)
+  }
+  if (close < 0) return [text]
+  const head = text.slice(0, open)
+  const body = text.slice(open + 1, close)
+  const tail = text.slice(close + 1)
+  let options: string[]
+  if (commas.length > 0) {
+    options = []
+    let from = open + 1
+    for (const comma of [...commas, close]) {
+      options.push(text.slice(from, comma))
+      from = comma + 1
+    }
+  } else {
+    const range = /^(.)\.\.(.)$/.exec(body)
+    if (range === null) {
+      // Not a brace group (`${d}`, `{}`): keep the braces and look at what follows.
+      return expandBraces(tail).map((rest) => `${head}{${body}}${rest}`)
+    }
+    const from = (range[1] as string).charCodeAt(0)
+    const to = (range[2] as string).charCodeAt(0)
+    options = []
+    for (let code = Math.min(from, to); code <= Math.max(from, to) && options.length < MAX_BRACE_ALTERNATIVES; code++) {
+      options.push(String.fromCharCode(code))
+    }
+  }
+  const out: string[] = []
+  for (const option of options) {
+    for (const rest of expandBraces(tail)) {
+      for (const inner of expandBraces(option)) {
+        out.push(`${head}${inner}${rest}`)
+        if (out.length >= MAX_BRACE_ALTERNATIVES) return out
+      }
+    }
+  }
+  return out
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** One path segment as a shell glob (`*`, `?`, `[...]`), turned into a regular expression source. A placeholder stands for an expansion. */
+function globSource(segment: string, placeholder: string): string {
+  let source = ''
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment.charAt(i)
+    if (ch === '*') source += '.*'
+    else if (ch === '?') source += '.'
+    else if (ch === placeholder) source += '.*'
+    else if (ch === '[') {
+      const end = segment.indexOf(']', i + 2)
+      if (end < 0) {
+        source += '\\['
+        continue
+      }
+      let set = segment.slice(i + 1, end)
+      if (set.startsWith('!')) set = `^${set.slice(1)}`
+      source += `[${set.replace(/\\/g, '\\\\')}]`
+      i = end
+    } else source += escapeRegExp(ch)
+  }
+  return source
+}
+
+/** The word, read as a glob, can match the name `.ewm`. A leading wildcard never matches the leading dot (no dotglob). */
+function globMayMatchEwm(word: string): boolean {
+  for (const alternative of expandBraces(word)) {
+    for (const segment of alternative.split('/')) {
+      if (segment === '' || /^[*?[]/.test(segment)) continue
+      try {
+        if (new RegExp(`^${globSource(segment, '\u0001')}$`, 'i').test(EWM_NAME)) return true
+      } catch {
+        return true // a pattern that cannot be read is not trusted
+      }
+    }
+  }
+  return false
+}
+
+const EXPANSION = /\$\{[^}]*\}|\$\([^)]*\)?|\$[A-Za-z_][A-Za-z0-9_]*|`[^`]*`?/g
+
+/** A word with an expansion (`${d}wm`, `.e${x}`) could expand to the name: some literal text that fits inside `.ewm`, with the expansions standing for any text. */
+function expansionMayBuildEwm(word: string): boolean {
+  if (!word.includes('$') && !word.includes('`')) return false
+  const marked = word.replace(EXPANSION, '\u0001')
+  for (const segment of marked.split('/')) {
+    const literal = segment.replace(/\u0001/g, '')
+    if (literal.length < 2 || literal.length === segment.length) continue
+    if (new RegExp(`^${globSource(segment, '\u0001').replace(/\.\*(?:\.\*)+/g, '.*')}$`, 'i').test(EWM_NAME)) return true
+  }
+  return false
+}
+
+/** The text with quotes, backslashes, `+` and `,` removed (and the gap between two adjacent strings): `'.e'+'wm'`, `'.e' 'wm'`, `.e\wm` and `".e""wm"` read as `.ewm`. */
+function squashed(text: string): string {
+  return text.replace(/(["'])\s+(["'])/g, '$1$2').replace(/["'\\+,]/g, '')
+}
+
+function mentionsEwmText(text: string): boolean {
+  return EWM_MENTION.test(text) || EWM_MENTION.test(squashed(text)) || /dotglob/i.test(text)
+}
+
+/** Whether the scanned command names or can build the `.ewm` folder in a way the plain text does not show. */
+function buildsEwmName(scan: Scan): boolean {
+  for (const word of scan.globWords) if (globMayMatchEwm(word)) return true
+  for (const word of scan.allWords) {
+    if (expansionMayBuildEwm(word)) return true
+    const assignment = ASSIGNMENT.exec(word)
+    if (assignment !== null && EWM_FRAGMENTS.has(word.slice(assignment[0].length))) return true
+  }
+  return false
+}
 
 /** A word that starts with an expansion (`$X`, `$(...)`, a backtick) may expand to nothing and let the next word become the program. */
 function startsWithExpansion(word: string): boolean {
@@ -696,6 +871,11 @@ function envSplitString(args: readonly string[]): string | null {
   return null
 }
 
+/** Plain whitespace split for alias values (`push --force`). */
+function splitWords(text: string): string[] {
+  return text.split(/\s+/).filter((word) => word !== '')
+}
+
 function isRecursiveForceRm(args: readonly string[]): boolean {
   let recursive = false
   let force = false
@@ -714,6 +894,8 @@ function isRecursiveForceRm(args: readonly string[]): boolean {
 
 type GitCall = {
   globals: string[]
+  /** The `name=value` of every `-c name=value` before the subcommand. */
+  configs: string[]
   sub: string | null
   rest: string[]
   /** A word before the subcommand started with an expansion and was skipped: what git really sees is unknown. */
@@ -723,6 +905,7 @@ type GitCall = {
 /** The subcommand of a git command line and the words after it, with git's global options skipped. */
 function parseGit(args: readonly string[]): GitCall {
   const globals: string[] = []
+  const configs: string[] = []
   let skippedExpansion = false
   let i = 0
   while (i < args.length) {
@@ -732,27 +915,77 @@ function parseGit(args: readonly string[]): GitCall {
       i++
       continue
     }
-    if (!arg.startsWith('-')) return { globals, sub: arg, rest: args.slice(i + 1), skippedExpansion }
+    if (!arg.startsWith('-')) return { globals, configs, sub: arg, rest: args.slice(i + 1), skippedExpansion }
     if (arg === '--') break
     globals.push(arg)
+    if (arg === '-c') configs.push(at(args, i + 1))
     const takesValue =
       arg === '-C' ||
       arg === '-c' ||
       ['--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env', '--attr-source'].includes(arg)
     i += takesValue ? 2 : 1
   }
-  return { globals, sub: null, rest: [], skippedExpansion }
+  return { globals, configs, sub: null, rest: [], skippedExpansion }
 }
 
-function inspectGit(args: readonly string[], facts: Facts): void {
-  const { sub, rest } = parseGit(args)
+const MAX_ALIAS_HOPS = 5
+const GIT_PROGRAM_CONFIG_KEYS = new Set([
+  'core.sshcommand', 'core.pager', 'core.fsmonitor', 'core.editor', 'core.askpass', 'diff.external', 'sequence.editor', 'gpg.program',
+])
+
+/** The value of `alias.<sub>` given with `git -c alias.<sub>=<value>` (git compares alias names case-insensitively), else null. */
+function inlineAlias(configs: readonly string[], sub: string): string | null {
+  const wanted = `alias.${sub}`.toLowerCase()
+  for (let i = configs.length - 1; i >= 0; i--) {
+    const config = at(configs, i)
+    const equals = config.indexOf('=')
+    if (equals > 0 && config.slice(0, equals).toLowerCase() === wanted) return config.slice(equals + 1)
+  }
+  return null
+}
+
+/** The verb of `git submodule <verb> ...` and the words after it. */
+function submoduleVerb(rest: readonly string[]): { verb: string | undefined; after: readonly string[] } {
+  const index = rest.findIndex((arg) => !arg.startsWith('-'))
+  return index < 0 ? { verb: undefined, after: [] } : { verb: at(rest, index), after: rest.slice(index + 1) }
+}
+
+function inspectGit(args: readonly string[], depth: number, facts: Facts, hops = 0, inherited: readonly string[] = []): void {
+  const parsed = parseGit(args)
+  const { sub, rest } = parsed
+  const configs = [...inherited, ...parsed.configs]
   if (sub === null) return
+  // CR18: `git -c alias.x=<value> x` runs <value>: a `!` alias is a shell command, any other alias is a git command line.
+  // Git ignores an alias named like a built-in command, so the subcommand itself is inspected as well.
+  const alias = inlineAlias(configs, sub)
+  if (alias !== null) {
+    if (hops >= MAX_ALIAS_HOPS) facts.destructive = true // a chain too long to follow
+    else if (alias.startsWith('!')) inspectSource([alias.slice(1), ...rest].join(' '), depth + 1, facts)
+    else inspectGit([...splitWords(alias), ...rest], depth, facts, hops + 1, configs)
+  }
+  // Config keys that name a program git then runs: what the program does is what the command does.
+  for (const config of configs) {
+    const equals = config.indexOf('=')
+    if (equals > 0 && GIT_PROGRAM_CONFIG_KEYS.has(config.slice(0, equals).toLowerCase())) {
+      inspectSource(config.slice(equals + 1).replace(/^!/, ''), depth + 1, facts)
+    }
+  }
+  if (sub === 'submodule') {
+    // `git submodule foreach <command>` runs the command in a shell inside every submodule.
+    const { verb, after } = submoduleVerb(rest)
+    if (verb === 'foreach') {
+      let first = 0
+      while (first < after.length && at(after, first).startsWith('-')) first++
+      inspectSource(after.slice(first).join(' '), depth + 1, facts)
+    }
+  }
   if (sub === 'push') facts.destructive = true
   else if (sub === 'reset' && rest.some((arg) => isLongOption(arg, 'hard'))) facts.destructive = true
   else if (sub === 'clean' && rest.some((arg) => /[fdxX]/.test(shortCluster(arg)) || isLongOption(arg, 'force'))) facts.destructive = true
   else if ((sub === 'checkout' || sub === 'restore') && rest.some((arg) => WHOLE_TREE_PATHSPECS.has(arg))) facts.destructive = true
   else if (NETWORK_GIT_SUBCOMMANDS.has(sub)) facts.network = true
-  else if ((sub === 'submodule' || sub === 'remote') && firstPositional(rest) === 'update') facts.network = true
+  else if (sub === 'remote' && firstPositional(rest) === 'update') facts.network = true
+  else if (sub === 'submodule' && ['update', 'add'].includes(submoduleVerb(rest).verb ?? '')) facts.network = true
 }
 
 function inspectFind(args: readonly string[], depth: number, facts: Facts): void {
@@ -772,7 +1005,7 @@ function inspectProgram(program: string, args: readonly string[], depth: number,
   if (program.startsWith('mkfs') || program === 'shred') facts.destructive = true
   switch (program) {
     case 'git':
-      inspectGit(args, facts)
+      inspectGit(args, depth, facts)
       break
     case 'rm':
       if (isRecursiveForceRm(args)) facts.destructive = true
@@ -831,6 +1064,7 @@ function inspectSource(src: string, depth: number, facts: Facts): Scan | null {
   if (depth > MAX_SHELL_DEPTH) return null
   const scan = scanCommand(src)
   if (scan === null) return null
+  if (mentionsEwmText(src) || buildsEwmName(scan)) facts.mentionsEwm = true
   for (const segment of scan.segments) inspectSegment(segment, depth, facts)
   for (const line of scan.heredocLines) inspectSource(line, depth + 1, facts)
   return scan
@@ -901,7 +1135,8 @@ const READ_ONLY_PROGRAMS = new Map<string, ArgRule>([
   ...UNRESTRICTED_READ_ONLY.map((name): [string, ArgRule] => [name, anyArgs]),
   ['rg', (args) => !args.some((arg) => isLongOption(arg, 'pre') || isLongOption(arg, 'hostname-bin'))],
   ['find', (args) => !args.some((arg) => FIND_UNSAFE_PREFIXES.some((prefix) => arg.startsWith(prefix)))],
-  ['tree', (args) => !args.some((arg) => shortCluster(arg).includes('o') || isLongOption(arg, 'output'))],
+  // tree -R re-runs tree in every directory at the -L depth and writes a 00Tree.html file there (CR18).
+  ['tree', (args) => !args.some((arg) => /[oR]/.test(shortCluster(arg)) || isLongOption(arg, 'output'))],
   ['file', (args) => !args.some((arg) => shortCluster(arg).includes('C') || isLongOption(arg, 'compile'))],
   [
     'sort',
@@ -939,7 +1174,7 @@ function matchesValidationCommand(command: string, profile: Profile): boolean {
   const normalized = normalizeSpaces(command)
   return profile.validation.commands.some((allowed) => {
     const expected = normalizeSpaces(allowed)
-    return expected !== '' && (normalized === expected || normalized.startsWith(expected + ' '))
+    return expected !== '' && normalized === expected // CR11: the exact command; extra arguments change what runs
   })
 }
 
@@ -952,7 +1187,7 @@ export type BashClass = 'read_only' | 'validation' | 'destructive' | 'network' |
 type BashAnalysis = { cls: BashClass; mentionsEwm: boolean }
 
 function analyzeBash(command: string, profile: Profile): BashAnalysis {
-  const facts: Facts = { destructive: false, network: false, mentionsEwm: EWM_MENTION.test(command) }
+  const facts: Facts = { destructive: false, network: false, mentionsEwm: mentionsEwmText(command) }
   const scan = inspectSource(command, 0, facts)
   const result = (cls: BashClass): BashAnalysis => ({ cls, mentionsEwm: facts.mentionsEwm })
   if (scan === null) return result('other')
@@ -1064,7 +1299,8 @@ function describeWriteDenial(tool: string, phase: Phase, allowWriteInExplore: bo
 /** The verdict for one tool call. Matrix (first match wins):
  *  1 inert (no task, PAUSED, DONE); 2 read-only agents; 3 own tools; 4 always-denied tools; 5 the /ewm skill;
  *  6 writes to .ewm/; 7 Bash/Monitor (destructive, network, .ewm); 8 outbound and third-party MCP tools;
- *  9 IMPLEMENT allows the rest; 10 the other phases allow only SAFE_TOOLS, allowed MCP tools and read-only commands. */
+ *  9 IMPLEMENT allows the rest; 10 the other phases allow only SAFE_TOOLS, NETWORK_READ_TOOLS under external_network: allow,
+ *  listed MCP tools and read-only commands. */
 export function evaluateToolCall(ctx: PolicyContext, call: PolicyCall): ToolVerdict {
   const { phase, profile, root, agentType } = ctx
   const { tool, input } = call
@@ -1150,8 +1386,16 @@ export function evaluateToolCall(ctx: PolicyContext, call: PolicyCall): ToolVerd
   // 9. IMPLEMENT: Claude Code's own permissions still apply.
   if (phase === 'IMPLEMENT') return allow()
 
-  // 10. The other phases are an allowlist (F2, D4). An mcp__ tool that got here passed rule 8.
-  if (SAFE_TOOLS.includes(tool) || tool.startsWith('mcp__')) return allow()
+  // 10. The other phases are an allowlist (F2, D4).
+  if (SAFE_TOOLS.includes(tool)) return allow()
+  if (NETWORK_READ_TOOLS.includes(tool) && profile.policies.external_network === 'allow') return allow() // CR2 (rule 8 denied them otherwise)
+  if (tool.startsWith('mcp__')) {
+    // CR12: before IMPLEMENT and in VALIDATE a third-party MCP tool runs only when the profile lists it, whatever external_network says.
+    if (mcpToolAllowed(tool, profile.policies.allowed_mcp_tools)) return allow()
+    return deny(
+      `ewm: ${tool} is a third-party MCP tool and is denied in ${phase} (rule: before IMPLEMENT only tools listed in policies.allowed_mcp_tools run). Add it to policies.allowed_mcp_tools in .ewm/project.yaml and run /ewm resume, move on to IMPLEMENT once the plan is approved (ask the person to run /ewm approve), or ${PAUSE_HINT}.`,
+    )
+  }
   if (WRITE_TOOLS.includes(tool)) {
     if (phase === 'EXPLORE' && profile.policies.allow_write_in_explore) return allow()
     return deny(describeWriteDenial(tool, phase, profile.policies.allow_write_in_explore))

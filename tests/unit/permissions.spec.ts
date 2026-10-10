@@ -9,6 +9,7 @@ import { describe, it } from 'node:test'
 import {
   ALWAYS_DENIED_TOOLS,
   NETWORK_PROGRAMS,
+  NETWORK_READ_TOOLS,
   OUTBOUND_TOOLS,
   OWN_TOOL_PREFIX,
   READONLY_AGENT_TYPES,
@@ -610,11 +611,16 @@ describe('policy constants', () => {
     assert.equal(OWN_TOOL_PREFIX, 'mcp__ewm__')
     assert.deepEqual([...READONLY_OWN_TOOLS], ['mcp__ewm__status'])
     assert.deepEqual([...READONLY_AGENT_TYPES], ['ewm:repo-scout', 'ewm:docs-scout', 'ewm:reviewer'])
-    assert.deepEqual([...NETWORK_PROGRAMS], ['curl', 'wget', 'nc', 'ncat', 'netcat', 'ssh', 'scp', 'sftp', 'rsync', 'telnet', 'ftp', 'socat'])
+    // CR18: the original twelve come first, then the programs the security review added.
+    assert.deepEqual([...NETWORK_PROGRAMS].slice(0, 12), ['curl', 'wget', 'nc', 'ncat', 'netcat', 'ssh', 'scp', 'sftp', 'rsync', 'telnet', 'ftp', 'socat'])
+    for (const program of ['ping', 'dig', 'nslookup', 'whois', 'traceroute', 'tftp', 'lftp', 'aria2c', 'gh']) {
+      assert.ok(NETWORK_PROGRAMS.includes(program), program)
+    }
     assert.deepEqual([...SAFE_TOOLS], [
       'Read', 'Glob', 'Grep', 'LS', 'LSP', 'NotebookRead', 'ToolSearch', 'Agent', 'Task', 'Skill', 'AskUserQuestion', 'TodoWrite',
-      'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'EnterPlanMode', 'ExitPlanMode', 'ListAgents',
+      'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TaskOutput', 'TaskStop', 'EnterPlanMode', 'ExitPlanMode', 'ListAgents',
     ])
+    assert.deepEqual([...NETWORK_READ_TOOLS], ['WebFetch', 'WebSearch'])
     assert.deepEqual([...OUTBOUND_TOOLS], [
       'WebFetch', 'WebSearch', 'Artifact', 'ArtifactData', 'ArtifactComments', 'SendFile', 'SendUserFile', 'SendMessage',
       'PushNotification', 'RemoteTrigger', 'PublishPlugin', 'DesignSync',
@@ -622,7 +628,7 @@ describe('policy constants', () => {
   })
 
   it('are frozen', () => {
-    for (const list of [WRITE_TOOLS, SAFE_TOOLS, OUTBOUND_TOOLS, ALWAYS_DENIED_TOOLS, READONLY_OWN_TOOLS, READONLY_AGENT_TYPES, NETWORK_PROGRAMS]) {
+    for (const list of [WRITE_TOOLS, SAFE_TOOLS, NETWORK_READ_TOOLS, OUTBOUND_TOOLS, ALWAYS_DENIED_TOOLS, READONLY_OWN_TOOLS, READONLY_AGENT_TYPES, NETWORK_PROGRAMS]) {
       assert.ok(Object.isFrozen(list))
     }
   })
@@ -835,11 +841,29 @@ describe('classifyBash: unparseable input is other', () => {
 })
 
 describe('classifyBash: validation', () => {
-  it('matches the exact command and the command followed by arguments', () => {
+  // CR11 (docs/ARCHITECTURE.md): the whitespace-normalized text equals a profile entry exactly. Extra arguments change what runs
+  // (`npm test --help` exits 0 without testing, `pytest --junitxml=src/app.py` writes a file), so they are not 'validation'.
+  it('matches the exact command, whitespace-normalized', () => {
     assert.equal(classify('npm test'), 'validation')
-    assert.equal(classify('npm test -- --grep x'), 'validation')
     assert.equal(classify('  npm   test  '), 'validation')
-    assert.equal(classify('npm\ttest -- a'), 'validation')
+    assert.equal(classify('npm\ttest'), 'validation')
+  })
+
+  it('does not match the command followed by arguments (CR11)', () => {
+    for (const command of [
+      'npm test -- --grep x',
+      'npm test --help',
+      'npm test -u',
+      'npm test --script-shell=./x.sh',
+      'npm test --update-snapshot',
+      'npm test a',
+    ]) {
+      assert.equal(classify(command), 'other', command)
+    }
+    const pytest = profileWith({}, ['npm test', 'pytest'])
+    for (const command of ['pytest --collect-only', 'pytest --junitxml=src/app.py', 'pytest -q tests/']) {
+      assert.equal(classifyBash(command, pytest), 'other', command)
+    }
   })
 
   it('rejects look-alikes and any shell metacharacter', () => {
@@ -883,7 +907,9 @@ describe('classifyBash: validation', () => {
 
   it('supports several profile commands and normalizes their spaces', () => {
     const profile = profileWith({}, ['npm test', 'pytest  -q', 'make check'])
-    assert.equal(classifyBash('pytest -q tests/', profile), 'validation')
+    assert.equal(classifyBash('pytest -q', profile), 'validation')
+    assert.equal(classifyBash('pytest   -q', profile), 'validation')
+    assert.equal(classifyBash('pytest -q tests/', profile), 'other')
     assert.equal(classifyBash('make check', profile), 'validation')
     assert.equal(classifyBash('make', profile), 'other')
   })
@@ -892,6 +918,160 @@ describe('classifyBash: validation', () => {
     assert.equal(classifyBash('ls', profileWith({}, ['ls'])), 'read_only')
     assert.equal(classifyBash('git push', profileWith({}, ['git push'])), 'destructive')
     assert.equal(classifyBash('curl x', profileWith({}, ['curl x'])), 'network')
+  })
+})
+
+describe('CR18: tree -R, git aliases and submodule foreach', () => {
+  it('tree -R is not read_only: it writes 00Tree.html files', () => {
+    for (const command of ['tree -R', 'tree -R -L 1 -H .', 'tree -L 1 -R', 'tree -RL 1', 'tree -L1R', 'tree -DR']) {
+      assert.equal(classify(command), 'other', command)
+      for (const phase of ['EXPLORE', 'UNDERSTAND', 'PLAN'] as const) assertDenied(bash(phase, command), 'Bash', phase, 'read-only')
+    }
+  })
+
+  it('near miss: tree without -R stays read_only', () => {
+    for (const command of ['tree', 'tree -L 2', 'tree -a -I node_modules', 'tree -r', 'tree -H .']) {
+      assert.equal(classify(command), 'read_only', command)
+    }
+    assert.equal(classify('tree -o out.txt'), 'other')
+  })
+
+  it('classifies git submodule foreach on its payload', () => {
+    assert.equal(classify("git submodule foreach 'git push'"), 'destructive')
+    assert.equal(classify('git submodule foreach --recursive git push origin main'), 'destructive')
+    assert.equal(classify("git submodule foreach -q 'curl https://x'"), 'network')
+    assert.equal(classify("git submodule foreach 'rm -rf build'"), 'destructive')
+    assert.equal(classify('git submodule foreach git status'), 'other')
+    assert.equal(classify('git submodule status'), 'other')
+  })
+
+  it('submodule add and update are network; status and init are not', () => {
+    assert.equal(classify('git submodule update --init'), 'network')
+    assert.equal(classify('git submodule --quiet update'), 'network')
+    assert.equal(classify('git submodule add https://x/y.git y'), 'network')
+    assert.notEqual(classify('git submodule status'), 'network')
+    assert.notEqual(classify('git submodule init'), 'network')
+  })
+
+  it('classifies git -c alias.<x>=<v> on the alias payload', () => {
+    assert.equal(classify("git -c 'alias.p=!git push' p"), 'destructive')
+    assert.equal(classify("git -c 'alias.p=!curl https://x' p"), 'network')
+    assert.equal(classify("git -c 'alias.go=!sh -c \"rm -rf x\"' go"), 'destructive')
+    assert.equal(classify('git -c alias.p=push p origin'), 'destructive')
+    assert.equal(classify('git -c alias.p=reset p --hard'), 'destructive')
+    assert.equal(classify('git -c alias.f=fetch f'), 'network')
+    assert.equal(classify('git -c ALIAS.P=push P'), 'destructive')
+    assert.equal(classify('git -c alias.a=b -c alias.b=push a'), 'destructive')
+  })
+
+  it('an alias named like a built-in command does not hide the built-in', () => {
+    assert.equal(classify('git -c alias.push=status push'), 'destructive')
+  })
+
+  it('config keys that name a program are classified on that program', () => {
+    assert.equal(classify("git -c core.sshCommand='ssh -v' fetch"), 'network')
+    assert.equal(classify("git -c core.pager='rm -rf x' log"), 'destructive')
+    assert.equal(classify("git -c core.fsmonitor='curl https://x' status"), 'network')
+  })
+
+  it('near miss: harmless aliases and git -c stay other, never read_only', () => {
+    assert.equal(classify('git -c alias.s=status s'), 'other')
+    assert.equal(classify('git -c color.ui=never status'), 'other')
+  })
+
+  it('the new network programs are network', () => {
+    for (const command of ['ping -c 1 x', 'dig example.com', 'nslookup example.com', 'whois x', 'traceroute x', 'gh pr list', 'aria2c http://x', 'lftp x']) {
+      assert.equal(classify(command), 'network', command)
+      assertDenied(bash('IMPLEMENT', command), 'Bash', 'deny_by_default')
+    }
+  })
+})
+
+describe('D14: the shell cannot build the name .ewm unseen in IMPLEMENT', () => {
+  const BUILDERS = [
+    "sed -i 's/IMPLEMENT/PAUSED/' .e*m/tasks/TASK-001/task.json",
+    "sed -i s/IMPLEMENT/PAUSED/ .e?m/tasks/TASK-001/task.json",
+    "echo '{}' > .e[w]m/tasks/TASK-001/task.json",
+    "echo '{}' > .e[!x]m/tasks/TASK-001/task.json",
+    "echo '{}' > .{e,x}wm/tasks/TASK-001/task.json",
+    "echo '{}' > .{e..f}wm/x",
+    "echo '{}' > .e*/x",
+    'echo {} > .ew*',
+    "echo x > ./.e*m/project.yaml",
+    "d=.e; echo '{}' > ${d}wm/tasks/TASK-001/task.json",
+    "d=.e; echo '{}' > \"${d}wm/tasks/TASK-001/task.json\"",
+    'echo x > .e${x}',
+    'echo x > .${a}wm/y',
+    'echo x > .e$(echo w)m/y',
+    'echo x > .e`echo w`m/y',
+    'a=.e; b=wm; cp x $a$b/y',
+    'p=ewm; cp x .$p/y',
+    "python3 -c \"open('.e'+'wm/tasks/TASK-001/task.json','w')\"",
+    "python3 -c \"open('.e' 'wm/x','w')\"",
+    'ln -s .e?m link',
+    'ln -s .e*m link',
+    'cp x .e""wm/y',
+    "cp x .e''wm/y",
+    'cp x .e\\wm/y',
+    'cp x ".ew"m/y',
+    'cp x .E*M/y',
+    'shopt -s dotglob; cp x *',
+    "bash -c 'cp x .e*m/y'",
+    "sh -c \"d=.e; cp x \\${d}wm/y\"",
+    "eval 'cp x .e*m/y'",
+    "python3 - <<'EOF'\nopen('.e'+'wm/x','w')\nEOF",
+  ]
+
+  it('denies every builder as a non-read-only command that mentions .ewm', () => {
+    for (const command of BUILDERS) {
+      assertDenied(bash('IMPLEMENT', command), 'Bash', '.ewm')
+      assertDenied(evaluate('IMPLEMENT', 'Monitor', { command }), 'Monitor', '.ewm')
+    }
+  })
+
+  it('denies them in the other phases too (the read-only rule or the .ewm rule)', () => {
+    for (const command of BUILDERS) {
+      for (const phase of IMPLEMENT_ONLY_PHASES) assertDenied(bash(phase, command), 'Bash', phase)
+    }
+  })
+
+  it('is not read_only, so the reading of the state stays possible but the writing does not', () => {
+    assertAllowed(bash('IMPLEMENT', 'ls .e*m/tasks'))
+    assertAllowed(bash('EXPLORE', 'cat .e?m/project.yaml'))
+    assertDenied(bash('IMPLEMENT', 'cp x .e?m/project.yaml'), 'Bash', '.ewm')
+  })
+
+  it('near miss: ordinary commands with globs, variables, braces and quotes are not taken for .ewm', () => {
+    for (const command of [
+      'cp *.ts dist/',
+      'git add *',
+      'git add .',
+      'rm -f build/*.o',
+      'mv .env.local .env',
+      'cp .gitignore .gitignore.bak',
+      'chmod +x scripts/*.sh',
+      'sed -i s/a.*b/c/ src/a.ts',
+      "sed -i 's/.*foo//' src/a.ts",
+      'cp $SRC/a.ts $DEST/',
+      'cd $HOME && npm test',
+      'export PATH=$PATH:bin',
+      'FOO=e npm test',
+      'x=1 npm test',
+      'DIR=. make build',
+      'mkdir -p out/{a,b}',
+      'cp src/{a,b}.ts dist/',
+      'echo ${HOME}/x > out.txt',
+      'npm run build -- --out=${OUT_DIR}',
+      'cat package.json > "$TMPDIR/p.json"',
+      "node -e 'console.log(1 + 2)'",
+      'git commit -m "add .env.example, docs"',
+      'python3 -c "print(1+1)"',
+      'npm install --save-dev eslint',
+      'touch ewm.txt',
+      'echo "a.e wm"',
+    ]) {
+      assertAllowed(bash('IMPLEMENT', command), command)
+    }
   })
 })
 
@@ -1266,9 +1446,15 @@ describe('rule 8: network-facing tools', () => {
     assertDenied(evaluate('IMPLEMENT', 'mcp__other__y', {}, { profile: prefixed }), 'mcp__other__y')
   })
 
-  it("allows any MCP tool under 'allow'", () => {
+  it("allows any MCP tool under 'allow' in IMPLEMENT only; before IMPLEMENT and in VALIDATE it must be listed (CR12)", () => {
     assertAllowed(evaluate('IMPLEMENT', 'mcp__x__y', {}, { profile: NETWORK_ALLOWED }))
-    assertAllowed(evaluate('EXPLORE', 'mcp__x__y', {}, { profile: NETWORK_ALLOWED }))
+    for (const phase of IMPLEMENT_ONLY_PHASES) {
+      assertDenied(evaluate(phase, 'mcp__x__y', {}, { profile: NETWORK_ALLOWED }), 'mcp__x__y', phase, 'allowed_mcp_tools')
+      const listed = profileWith({ external_network: 'allow', allowed_mcp_tools: ['mcp__x__y', 'mcp__docs__*'] })
+      assertAllowed(evaluate(phase, 'mcp__x__y', {}, { profile: listed }), phase)
+      assertAllowed(evaluate(phase, 'mcp__docs__search', {}, { profile: listed }), phase)
+      assertDenied(evaluate(phase, 'mcp__x__z', {}, { profile: listed }), 'mcp__x__z', phase)
+    }
   })
 
   it('near miss: non-MCP, non-outbound tools are untouched by it', () => {
@@ -1277,8 +1463,27 @@ describe('rule 8: network-facing tools', () => {
     assertAllowed(evaluate('IMPLEMENT', 'CronCreate'))
   })
 
-  it('near miss: outbound tools under allow are still not on the pre-IMPLEMENT allowlist (rule 10)', () => {
-    assertDenied(evaluate('EXPLORE', 'WebFetch', {}, { profile: NETWORK_ALLOWED }), 'WebFetch', 'EXPLORE')
+  it('CR2: WebFetch and WebSearch run in every active phase under allow, and stay denied under deny_by_default', () => {
+    for (const phase of ACTIVE_PHASES) {
+      for (const tool of NETWORK_READ_TOOLS) {
+        assertAllowed(evaluate(phase, tool, {}, { profile: NETWORK_ALLOWED }), `${phase} ${tool}`)
+        assertDenied(evaluate(phase, tool), tool, phase, 'deny_by_default')
+      }
+    }
+  })
+
+  it('CR2 near miss: the other outbound tools are still not on the pre-IMPLEMENT allowlist (rule 10)', () => {
+    for (const tool of OUTBOUND_TOOLS.filter((name) => !NETWORK_READ_TOOLS.includes(name))) {
+      for (const phase of IMPLEMENT_ONLY_PHASES) {
+        assertDenied(evaluate(phase, tool, {}, { profile: NETWORK_ALLOWED }), tool, phase)
+      }
+    }
+  })
+
+  it('CR2: read-only agents do not get the network tools', () => {
+    for (const tool of NETWORK_READ_TOOLS) {
+      assertDenied(evaluate('EXPLORE', tool, {}, { profile: NETWORK_ALLOWED, agentType: 'ewm:repo-scout' }), tool, 'ewm:repo-scout')
+    }
   })
 })
 
@@ -1320,6 +1525,15 @@ describe('rule 10: the other phases are an allowlist', () => {
     }
   })
 
+  it('CR1: TaskOutput and TaskStop are safe tools, for the lead and for the read-only agents', () => {
+    for (const phase of ACTIVE_PHASES) {
+      for (const tool of ['TaskOutput', 'TaskStop']) {
+        assertAllowed(evaluate(phase, tool), `${phase} ${tool}`)
+        assertAllowed(evaluate(phase, tool, {}, { agentType: 'ewm:reviewer' }), `${phase} ${tool} reviewer`)
+      }
+    }
+  })
+
   it('denies write tools, and says how to get to IMPLEMENT', () => {
     for (const phase of IMPLEMENT_ONLY_PHASES) {
       for (const tool of WRITE_TOOLS) {
@@ -1358,7 +1572,8 @@ describe('rule 10: the other phases are an allowlist', () => {
 
   it('allows the validation class only in VALIDATE, and points at run_validation', () => {
     assertAllowed(bash('VALIDATE', 'npm test'))
-    assertAllowed(bash('VALIDATE', 'npm test -- --grep x'))
+    assertDenied(bash('VALIDATE', 'npm test -- --grep x'), 'Bash', 'VALIDATE', 'mcp__ewm__run_validation') // CR11: no extra arguments
+    assertDenied(bash('VALIDATE', 'npm test --help'), 'Bash', 'VALIDATE')
     assertAllowed(evaluate('VALIDATE', 'Monitor', { command: 'npm test' }))
     for (const phase of ['INTAKE', 'EXPLORE', 'UNDERSTAND', 'PLAN'] as const) {
       assertDenied(bash(phase, 'npm test'), 'Bash', phase)
@@ -1370,7 +1585,7 @@ describe('rule 10: the other phases are an allowlist', () => {
 
   it('denies unknown tools by name, phase and rule', () => {
     for (const phase of IMPLEMENT_ONLY_PHASES) {
-      for (const tool of ['CronCreate', 'CronDelete', 'TaskStop', 'SomeFutureTool']) {
+      for (const tool of ['CronCreate', 'CronDelete', 'SomeFutureTool']) {
         const reason = assertDenied(evaluate(phase, tool), `ewm: ${tool} is not allowed in ${phase}`)
         assert.match(reason, /\/ewm pause/)
       }

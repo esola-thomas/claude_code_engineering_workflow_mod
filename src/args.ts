@@ -13,7 +13,7 @@ export type EwmCommand =
   | { name: 'pause' }
   | { name: 'list' }
   | { name: 'help' }
-  | { name: 'approve'; note?: string } // /ewm approve [note...]
+  | { name: 'approve'; note?: string; plan?: string } // /ewm approve [--plan <hash>] [note...]
   | { name: 'reject'; note: string } // /ewm reject <reason...>  (note required)
 
 export const USAGE = [
@@ -24,7 +24,7 @@ export const USAGE = [
   '/ewm questions                         show open and resolved questions',
   '/ewm plan                              move to PLAN once understood, or show the plan',
   '/ewm pause                             save a checkpoint and leave the workflow',
-  '/ewm approve [note]                    approve the pending gate (plan or final acceptance)',
+  '/ewm approve [--plan <hash>] [note]    approve the pending gate (plan or final acceptance); --plan refuses if the plan is not the one with that hash',
   '/ewm reject <reason>                   send the pending gate back with a reason',
   '/ewm list                              list tasks',
   '/ewm help                              show this list',
@@ -149,6 +149,28 @@ function parseNew(rest: string): ParseResult {
   return goal === undefined ? { name: 'new', title } : { name: 'new', title, goal }
 }
 
+/** `--plan <hash>`: the hex prefix (8-64 digits) of the plan hash the person reviewed; the approval is refused when the plan has changed since. */
+const PLAN_FLAG = /^--plan(?=$|=|\s)=?\s*(\S*)\s*([\s\S]*)$/
+
+function parseApprove(rest: string): ParseResult {
+  let plan: string | undefined
+  let remaining = rest.trim()
+  const flag = PLAN_FLAG.exec(remaining)
+  if (flag !== null) {
+    const hash = flag[1] ?? ''
+    if (!/^[0-9a-fA-F]{8,64}$/.test(hash)) {
+      return fail('ewm: --plan needs the first 8 or more hex digits of the plan hash shown in /ewm status, e.g. /ewm approve --plan 6ec3494e.')
+    }
+    plan = hash.toLowerCase()
+    remaining = flag[2] ?? ''
+  }
+  const note = parseNote(remaining)
+  const command: Extract<EwmCommand, { name: 'approve' }> = { name: 'approve' }
+  if (note !== '') command.note = note
+  if (plan !== undefined) command.plan = plan
+  return command
+}
+
 function parseResume(rest: string): ParseResult {
   let tokens: string[]
   try {
@@ -182,10 +204,7 @@ export function parseCommand(input: string): EwmCommand | { error: string } {
 
   if (name === 'new') return parseNew(rest)
   if (name === 'resume') return parseResume(rest)
-  if (name === 'approve') {
-    const note = parseNote(rest)
-    return note === '' ? { name: 'approve' } : { name: 'approve', note }
-  }
+  if (name === 'approve') return parseApprove(rest)
   if (name === 'reject') {
     const note = parseNote(rest)
     if (note === '') return fail('ewm: reject needs a reason, e.g. /ewm reject "the plan skips the migration".')

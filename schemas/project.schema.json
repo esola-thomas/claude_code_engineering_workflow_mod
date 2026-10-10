@@ -2,54 +2,59 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/esola-thomas/claude_code_engineering_workflow_mod/schemas/project.schema.json",
   "title": "ewm project profile",
-  "description": "Project profile for the Engineering Workflow Mod (ewm), read from .ewm/project.yaml or .ewm/project.json. Mirrors the Profile type in src/types.ts; the defaults are DEFAULT_PROFILE in src/profile.ts. Holds configuration only, never task state.",
+  "description": "Project profile for the Engineering Workflow Mod (ewm), read from .ewm/project.yaml or .ewm/project.json. Mirrors the Profile type in src/types.ts; the defaults are DEFAULT_PROFILE in src/profile.ts. Every key is optional: the loader fills the defaults in and only warns about unknown keys, so this schema neither requires keys nor forbids extra ones. Holds configuration only, never task state.",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["profile_id", "name", "repositories", "domains", "entrypoints", "policies", "models", "budgets", "validation"],
   "properties": {
     "profile_id": {
+      "default": "default",
       "type": "string",
       "pattern": "\\S",
       "description": "Short id stored on every task. Must not be blank."
     },
     "name": {
+      "default": "Default",
       "type": "string",
       "pattern": "\\S",
       "description": "Human-readable project name. Must not be blank."
     },
     "repositories": {
+      "default": ["."],
       "type": "array",
       "items": { "type": "string" },
       "description": "Repository roots, relative to the workspace."
     },
     "domains": {
+      "default": [],
       "type": "array",
       "items": { "type": "string" },
       "description": "Business or technical areas the project covers."
     },
     "entrypoints": {
+      "default": ["README.md", "docs/"],
       "type": "array",
       "items": { "type": "string" },
       "description": "Where exploration starts: repo-relative files or directories."
     },
     "policies": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["external_network", "require_plan_approval", "allow_write_in_explore", "allowed_mcp_tools"],
       "properties": {
         "external_network": {
+          "default": "deny_by_default",
           "enum": ["deny_by_default", "allow"],
           "description": "deny_by_default blocks web access, outbound tools, third-party MCP tools and network commands while a task is active."
         },
         "require_plan_approval": {
+          "default": true,
           "type": "boolean",
           "description": "When true, moving from PLAN to IMPLEMENT needs a recorded human approval."
         },
         "allow_write_in_explore": {
+          "default": false,
           "type": "boolean",
           "description": "When true, repository writes are allowed during EXPLORE."
         },
         "allowed_mcp_tools": {
+          "default": [],
           "type": "array",
           "items": { "type": "string" },
           "description": "Third-party MCP tool names allowed while a task is active: exact names, or a prefix ending in '*'."
@@ -58,20 +63,21 @@
     },
     "models": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["lead", "search", "reviewer"],
       "properties": {
         "lead": {
+          "default": "opus",
           "type": "string",
           "pattern": "\\S",
           "description": "Model for the lead role. Recorded in the profile; not routed in v0.0.0."
         },
         "search": {
+          "default": "haiku",
           "type": "string",
           "pattern": "\\S",
           "description": "Model for the search agents (ewm:repo-scout, ewm:docs-scout)."
         },
         "reviewer": {
+          "default": "sonnet",
           "type": "string",
           "pattern": "\\S",
           "description": "Model for the reviewer agent (ewm:reviewer)."
@@ -80,20 +86,21 @@
     },
     "budgets": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["max_parallel_researchers", "max_research_rounds_without_user_update", "max_findings_per_scout"],
       "properties": {
         "max_parallel_researchers": {
+          "default": 3,
           "type": "integer",
           "minimum": 1,
           "description": "Maximum research agents running at once."
         },
         "max_research_rounds_without_user_update": {
+          "default": 2,
           "type": "integer",
           "minimum": 1,
           "description": "Research rounds allowed before the model must report back to the person."
         },
         "max_findings_per_scout": {
+          "default": 8,
           "type": "integer",
           "minimum": 1,
           "description": "Maximum findings a scout returns per delegation."
@@ -102,15 +109,15 @@
     },
     "validation": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["commands", "timeout_ms"],
       "properties": {
         "commands": {
+          "default": [],
           "type": "array",
           "items": { "type": "string" },
           "description": "Allowlisted validation commands, such as \"npm test\". Run without a shell."
         },
         "timeout_ms": {
+          "default": 300000,
           "type": "integer",
           "minimum": 1,
           "description": "Time limit for each validation command, in milliseconds."

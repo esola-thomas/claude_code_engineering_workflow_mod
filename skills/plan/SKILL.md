@@ -58,7 +58,7 @@ A good step changes one thing and can be shown as one diff. A good plan names wh
 
 - Plan with the person; do not delegate the design. For fact checks use Read, Grep and Glob, or a scout ("ewm:repo-scout", "ewm:docs-scout") with a bounded ask (a scope and N findings).
 - At most the profile's `budgets.max_parallel_researchers` scouts at once (default 3). The Agent tool may run them in the background; wait for their results before you synthesize. Dedupe.
-- Optionally ask "ewm:reviewer" to challenge the draft's risks and ordering.
+- Optionally ask "ewm:reviewer" to challenge the draft's risks and ordering. (The diff review in IMPLEMENT is not optional.)
 - Read cited lines yourself before relying on or recording a finding. Never record a finding without evidence.
 
 ## What the mod enforces in code
@@ -66,7 +66,7 @@ A good step changes one thing and can be shown as one diff. A good plan names wh
 - Before IMPLEMENT only read tools, read-only Bash and the mcp__ewm__* tools work. Edit and Write are denied.
 - Never edit `.ewm/` files directly, including plan.md. mcp__ewm__set_plan writes it.
 - Network tools are denied by default.
-- Gates need a human. You have no approve tool; do not run /ewm commands or invoke the `ewm` skill. The person runs `/ewm approve` or `/ewm reject <reason>`. Approval is bound to the plan content, so a changed plan needs a new approval.
+- Gates need a human. You have no approve tool; do not run /ewm commands or invoke the `ewm` skill. The person runs `/ewm approve` or `/ewm reject <reason>`. Approval is bound to the full plan content (a SHA-256 of it), and the Approve button and `/ewm approve --plan <hash>` are refused if the plan changed after the person read it. So after mcp__ewm__set_plan do not change the plan again while the person is deciding; a changed plan needs a new approval.
 - If the profile sets `require_plan_approval: false`, mcp__ewm__advance to IMPLEMENT works without it. Still show the plan and get the person's explicit go-ahead first.
 - Follow any "ewm: " denial message instead of working around it.
 

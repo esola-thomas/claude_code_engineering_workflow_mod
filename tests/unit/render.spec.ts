@@ -14,6 +14,7 @@ import {
   renderSystemMap,
   renderTaskList,
   renderValidation,
+  stripControls,
 } from '../../src/render.ts'
 import type { GateState } from '../../src/render.ts'
 import { PHASES } from '../../src/types.ts'
@@ -739,14 +740,14 @@ describe('renderResumeBrief', () => {
     assert.match(text, /Where we were: PAUSED \(was PLAN\)/)
   })
 
-  it('lists the approved gates, but not a plan approval that no longer matches the plan', () => {
-    const approved: Approval = { gate: 'plan_approval', decision: 'approved', by: 'user', via: 'pane', at: AT, plan_hash: 'deadbeef' }
-    const task = makeRichTask({ approvals: [approved, { gate: 'done_acceptance', decision: 'rejected', by: 'user', via: 'command', at: AT }] })
-    assert.match(renderResumeBrief(task, makeStaleness()), /Approved gates: plan$/m)
-    const edited = { ...task, plan: makePlan({ hash: 'changed' }) }
-    assert.doesNotMatch(renderResumeBrief(edited, makeStaleness()), /Approved gates/)
-    const rejectedLater = { ...task, approvals: [approved, { ...approved, decision: 'rejected' as const }] }
-    assert.doesNotMatch(renderResumeBrief(rejectedLater, makeStaleness()), /Approved gates/)
+  it('lists the approved gates from the trusted gate state, never from the approvals in task.json (CR16)', () => {
+    const forged: Approval = { gate: 'plan_approval', decision: 'approved', by: 'user', via: 'pane', at: AT, plan_hash: makePlan().hash }
+    const task = makeRichTask({ approvals: [forged] })
+    const approved = { pending: null, planApproved: true, models: [] }
+    const notApproved = { pending: 'plan_approval' as const, planApproved: false, models: [] }
+    assert.match(renderResumeBrief(task, makeStaleness(), approved), /Approved gates: plan$/m)
+    assert.doesNotMatch(renderResumeBrief(task, makeStaleness(), notApproved), /Approved gates/)
+    assert.doesNotMatch(renderResumeBrief(task, makeStaleness()), /Approved gates/, 'without trusted state the brief claims nothing')
   })
 
   it('says when there are no decisions or open questions', () => {
@@ -867,5 +868,84 @@ describe('plain output', () => {
       renderResumeBrief(task, makeStaleness({ checked: false })),
     ]
     for (const text of outputs) assert.match(text, /^[\x20-\x7e\n]+$/, text)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run 2 hardening: CR16 (plan shown with its hash, control characters, review line)
+// ---------------------------------------------------------------------------
+
+describe('CR16: what the person is asked to approve is on screen', () => {
+  const profile = makeProfile()
+  const gate: GateState = { pending: 'plan_approval', planApproved: false, models: [], plan: { hash: 'ab'.repeat(32), steps: 3, summary: 'Fix the\n loop   bound' } }
+
+  it('status names the plan hash prefix and the step count in the gate line', () => {
+    const text = renderStatus(makeRichTask({ phase: 'PLAN' }), profile, gate)
+    assert.match(text, /Gate: plan approval pending \(plan abababab, 3 steps\)\./)
+  })
+
+  it('paneModel carries the full hash, the step count and a one-line summary only while the plan gate is pending', () => {
+    const task = makeRichTask({ phase: 'PLAN' })
+    assert.deepEqual(paneModel(task, profile, gate).plan, { hash: 'ab'.repeat(32), steps: 3, summary: 'Fix the loop bound' })
+    assert.equal(paneModel(task, profile, { ...gate, pending: null }).plan, null)
+    assert.equal(paneModel(task, profile, NO_GATE).plan, null)
+  })
+
+  it('plan.md shows the hash prefix next to the approval state', () => {
+    assert.match(renderPlan(makeRichTask({ phase: 'PLAN' }), gate), /Approval: not approved \| Plan: abababab/)
+    assert.doesNotMatch(renderPlan(makeRichTask({ phase: 'PLAN' }), NO_GATE), /\| Plan:/)
+  })
+
+  it('handoff.md says whether ewm:reviewer reviewed the diff', () => {
+    const none = renderHandoff(makeRichTask({ phase: 'DONE', agent_usage: [] }), [])
+    assert.match(none, /Diff review: no ewm:reviewer run was recorded for this task/)
+    const use = { agent_type: 'ewm:reviewer', model: 'claude-sonnet-5', phase: 'IMPLEMENT' as const, rule: 'profile.models.reviewer', at: AT }
+    const reviewed = renderHandoff(makeRichTask({ phase: 'DONE', agent_usage: [use, use] }), [])
+    assert.match(reviewed, /Diff review: ewm:reviewer ran 2 times \(last in IMPLEMENT\)/)
+  })
+})
+
+describe('CR16: model-written text cannot drive the terminal', () => {
+  const profile = makeProfile()
+
+  it('stripControls removes ANSI sequences, OSC titles and control characters but keeps newline and tab', () => {
+    assert.equal(stripControls('a\u001b[31mred\u001b[0m b'), 'ared b')
+    assert.equal(stripControls('x\u001b]0;title\u0007y'), 'xy')
+    assert.equal(stripControls('x\u001b]8;;http://e.example\u001b\\link\u001b]8;;\u001b\\y'), 'xlinky')
+    assert.equal(stripControls('a\u0000b\u0008c\u007fd\u009be'), 'abcde')
+    assert.equal(stripControls('line1\nline2\tcol'), 'line1\nline2\tcol')
+  })
+
+  it('status, pane model, task list and resume brief are free of escape characters', () => {
+    const evil = 'Fix\u001b[2J\u001b]0;pwned\u0007 it\rnow'
+    const task = makeRichTask({
+      title: evil,
+      next_action: evil,
+      open_questions: [{ id: 'Q-001', text: evil, status: 'open', raised_at: AT }],
+      decisions: [{ id: 'D-001', title: evil, choice: evil, rationale: evil, phase: 'EXPLORE', decided_by: 'model', at: AT }],
+      system_map: { mermaid: 'flowchart LR', text_map: evil, components: [evil], updated_at: AT },
+    })
+    const gateState: GateState = { pending: null, planApproved: false, models: [evil] }
+    const surfaces = [
+      renderStatus(task, profile, gateState),
+      JSON.stringify(paneModel(task, profile, gateState)),
+      renderTaskList([{ id: 'TASK-001', title: evil, phase: 'EXPLORE', updated_at: AT }], null),
+      renderResumeBrief(task, makeStaleness()),
+      renderDecisions(task),
+      renderQuestions(task),
+      renderSystemMap(task),
+    ]
+    for (const text of surfaces) {
+      assert.doesNotMatch(text, /[\u001b\u0007\r]/)
+      assert.doesNotMatch(text, /pwned/, 'the OSC payload is dropped with its sequence')
+    }
+    assert.match(renderStatus(task, profile, gateState), /Task: TASK-001 - Fix it now/)
+  })
+
+  it('markdown artifacts strip control characters from fenced output too', () => {
+    const run = makeRun(1, { output_tail: 'ok\u001b[32m green\u001b[0m\nline two' })
+    const text = renderValidation(makeRichTask({ validations: [run] }))
+    assert.doesNotMatch(text, /\u001b/)
+    assert.match(text, /ok green\nline two/)
   })
 })

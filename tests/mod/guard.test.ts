@@ -71,6 +71,39 @@ test('M14: in IMPLEMENT the model cannot write the workflow state, but can edit 
   expect(h.reached).toEqual(['Edit', 'Write'])
 })
 
+test('D14: in IMPLEMENT a shell command cannot build the name .ewm from a glob, a variable or a quote split', async ($, on) => {
+  const h = createHarness($, on)
+  await h.start()
+  await h.ewm('new "Fix sum"')
+  await h.advanceTo('EXPLORE', 'UNDERSTAND', 'PLAN')
+  await h.tool('set_plan', { summary: 's', steps: [{ text: 'fix', files: ['src/a.ts'] }], risks: [], tests: [], alternatives: [] })
+  await h.ewm('approve')
+  expect(h.task().phase).toBe('IMPLEMENT')
+  h.reached.length = 0
+
+  for (const command of [
+    "sed -i 's/IMPLEMENT/PAUSED/' .e*m/tasks/TASK-001/task.json",
+    "d=.e; echo '{}' > ${d}wm/tasks/TASK-001/task.json",
+    "python3 -c \"open('.e'+'wm/tasks/TASK-001/task.json','w')\"",
+    'ln -s .e?m link',
+  ]) {
+    const verdict = await $.tool.call({ tool: 'Bash', command })
+    expect(verdict.deny, command).toContain('.ewm')
+  }
+  expect(h.reached).toEqual([])
+  expect((await $.tool.call({ tool: 'Bash', command: 'git add *' })).deny).toBeUndefined()
+  expect(h.reached).toEqual(['Bash'])
+})
+
+test('CR12: before IMPLEMENT a third-party MCP tool needs allowed_mcp_tools', async ($, on) => {
+  const h = createHarness($, on)
+  await h.start()
+  await h.ewm('new "Fix sum"')
+  await h.advanceTo('EXPLORE')
+  h.reached.length = 0
+  expect((await $.tool.call({ tool: 'mcp__other__lookup' })).deny).toContain('allowed_mcp_tools')
+})
+
 test('M10: without an active task the mod is inert and its tools stay deferred', async ($, on) => {
   const h = createHarness($, on)
   await h.start()

@@ -5,8 +5,9 @@
 // expect a task whose approvals and validations are the trusted (ledger) ones;
 // the plan hash is always recomputed here, never read from `task.plan.hash` (D3, D14).
 
+import { sha256Hex } from './sha256.ts'
 import { ACTIVE_PHASES, EwmError } from './types.ts'
-import type { ActivePhase, Actor, Approval, GateName, Phase, Plan, Profile, Task } from './types.ts'
+import type { ActivePhase, Actor, Approval, GateName, Phase, Plan, Profile, Task, ValidationRun } from './types.ts'
 
 function edgesTo(...phases: Phase[]): readonly Phase[] {
   return Object.freeze(phases)
@@ -37,38 +38,7 @@ function isActivePhase(phase: string): phase is ActivePhase {
 // Plan hash
 // ---------------------------------------------------------------------------
 
-const FNV_OFFSET_BASIS = 0x811c9dc5
-const FNV_PRIME = 0x01000193
-
-/** UTF-8 bytes of a string (TextEncoder is not guaranteed in the hooks environment). Lone surrogates are encoded as-is. */
-function* utf8Bytes(text: string): Generator<number> {
-  for (const char of text) {
-    const code = char.codePointAt(0) as number
-    if (code < 0x80) {
-      yield code
-    } else if (code < 0x800) {
-      yield 0xc0 | (code >> 6)
-      yield 0x80 | (code & 0x3f)
-    } else if (code < 0x10000) {
-      yield 0xe0 | (code >> 12)
-      yield 0x80 | ((code >> 6) & 0x3f)
-      yield 0x80 | (code & 0x3f)
-    } else {
-      yield 0xf0 | (code >> 18)
-      yield 0x80 | ((code >> 12) & 0x3f)
-      yield 0x80 | ((code >> 6) & 0x3f)
-      yield 0x80 | (code & 0x3f)
-    }
-  }
-}
-
-function fnv1a32Hex(text: string): string {
-  let hash = FNV_OFFSET_BASIS
-  for (const byte of utf8Bytes(text)) hash = Math.imul(hash ^ byte, FNV_PRIME)
-  return (hash >>> 0).toString(16).padStart(8, '0')
-}
-
-/** Stable, order-sensitive hash (FNV-1a 32-bit hex over a canonical JSON of summary, steps[].text, steps[].files, risks, tests, alternatives). Step status is excluded. */
+/** Stable, order-sensitive hash (CR8: SHA-256 hex, 64 characters, over a canonical JSON of summary, steps[].text, steps[].files, risks, tests, alternatives). Step status is excluded. */
 export function planHash(plan: Omit<Plan, 'hash' | 'updated_at'>): string {
   // The object literal fixes the key order, so the JSON is canonical.
   const canonical = JSON.stringify({
@@ -78,7 +48,7 @@ export function planHash(plan: Omit<Plan, 'hash' | 'updated_at'>): string {
     tests: plan.tests,
     alternatives: plan.alternatives,
   })
-  return fnv1a32Hex(canonical)
+  return sha256Hex(canonical)
 }
 
 /** The hash of the plan as it is now, or null without a plan. */
@@ -112,9 +82,25 @@ function hasPlanSteps(task: Task): boolean {
   return task.plan !== null && task.plan.steps.length >= 1
 }
 
+/** When the task last entered VALIDATE, or null when it never did (the first entry is in task.transitions). */
+function lastEnteredValidate(task: Task): string | null {
+  for (let i = task.transitions.length - 1; i >= 0; i--) {
+    const item = task.transitions[i]
+    if (item !== undefined && item.to === 'VALIDATE') return item.at
+  }
+  return null
+}
+
+/** CR9: the runs that can back an acceptance: passing (ok) and recorded since the latest entry into VALIDATE.
+ *  A failing run, or a pass from before the code was changed again, does not count. The caller passes the trusted task. */
+export function freshValidations(task: Task): ValidationRun[] {
+  const since = lastEnteredValidate(task)
+  return task.validations.filter(run => run.ok && (since === null || run.at >= since))
+}
+
 /** The gate a human could act on now, else null:
  *  PLAN with plan (>=1 step), require_plan_approval, no valid approval -> 'plan_approval';
- *  VALIDATE with >= 1 validation and no valid acceptance -> 'done_acceptance'. */
+ *  VALIDATE with >= 1 passing validation recorded since entering VALIDATE (CR9) and no valid acceptance -> 'done_acceptance'. */
 export function pendingGate(task: Task, profile: Profile): GateName | null {
   if (
     task.phase === 'PLAN' &&
@@ -124,11 +110,14 @@ export function pendingGate(task: Task, profile: Profile): GateName | null {
   ) {
     return 'plan_approval'
   }
-  if (task.phase === 'VALIDATE' && task.validations.length >= 1 && !hasValidApproval(task, 'done_acceptance')) {
+  if (task.phase === 'VALIDATE' && freshValidations(task).length >= 1 && !hasValidApproval(task, 'done_acceptance')) {
     return 'done_acceptance'
   }
   return null
 }
+
+const STALE_VALIDATION =
+  'no passing validation run is recorded since the task entered VALIDATE (the last run failed, or the code changed after the last pass; fix it in IMPLEMENT if needed, then run mcp__ewm__run_validation again)'
 
 function whyNotPending(task: Task, gate: GateName, profile: Profile): string {
   if (gate === 'plan_approval') {
@@ -139,6 +128,7 @@ function whyNotPending(task: Task, gate: GateName, profile: Profile): string {
   }
   if (task.phase !== 'VALIDATE') return `done_acceptance is decided in VALIDATE, but ${task.id} is in ${task.phase}`
   if (task.validations.length === 0) return 'no validation run is recorded yet (use mcp__ewm__run_validation)'
+  if (freshValidations(task).length === 0) return STALE_VALIDATION
   return 'the work is already accepted'
 }
 
@@ -200,6 +190,9 @@ function checkAcceptanceGate(task: Task, actor: Actor): Verdict {
       'ewm: DONE needs at least one validation run (gate done_acceptance). Run an allowed command with mcp__ewm__run_validation first.',
     )
   }
+  if (freshValidations(task).length === 0) {
+    return gateRequired(`ewm: DONE needs a passing validation run (gate done_acceptance): ${STALE_VALIDATION}.`)
+  }
   if (!hasValidApproval(task, 'done_acceptance')) {
     return gateRequired(
       `ewm: DONE needs the person's acceptance (gate done_acceptance). ${approveHint(actor)} once the validation results are reviewed.`,
@@ -226,6 +219,11 @@ function evaluateTransition(task: Task, to: Phase, actor: Actor, profile: Profil
   if (!allowed.includes(to)) {
     return invalid(`ewm: ${task.id} cannot move from ${from} to ${to}. From ${from} the allowed next phases are: ${allowed.join(', ')}.`)
   }
+  if (from === 'UNDERSTAND' && to === 'PLAN' && actor !== 'user') {
+    return gateRequired(
+      `ewm: UNDERSTAND > PLAN is the person's call (they are ready to plan). Ask the person whether the understanding is right, and let them run /ewm plan.`,
+    )
+  }
   if (to === 'IMPLEMENT') return checkPlanGate(task, actor, profile)
   if (to === 'DONE') return checkAcceptanceGate(task, actor)
   return OK
@@ -234,7 +232,8 @@ function evaluateTransition(task: Task, to: Phase, actor: Actor, profile: Profil
 /** Whether `to` is reachable from task.phase by `actor` now. Rules:
  *  - edge must exist in EDGES (PAUSED/DONE/unknown -> not ok, explain);
  *  - -> IMPLEMENT: task.plan must exist with >= 1 step; if require_plan_approval, hasValidApproval(task,'plan_approval');
- *  - -> DONE: >= 1 entry in task.validations AND hasValidApproval(task,'done_acceptance');
+ *  - -> DONE: >= 1 passing entry in task.validations recorded since the latest entry into VALIDATE (CR9) AND hasValidApproval(task,'done_acceptance');
+ *  - UNDERSTAND -> PLAN: actor must be 'user' (CR10);
  *  - reasons name the missing condition and the human action (e.g. "ask the person to run /ewm approve").
  *  The caller passes a task whose approvals/validations are the trusted (ledger) ones. */
 export function checkTransition(task: Task, to: Phase, actor: Actor, profile: Profile): Check {
@@ -279,18 +278,25 @@ export function pause(task: Task, at: string, reason = 'paused'): Task {
 }
 
 /** PAUSED -> paused_from (records transition, clears paused_from). A non-PAUSED task is returned unchanged.
- *  A damaged task with no phase to return to restarts at INTAKE (every gate is recomputed from data, so this opens nothing). */
-export function resume(task: Task, at: string): Task {
+ *  A damaged task with no phase to return to restarts at INTAKE (every gate is recomputed from data, so this opens nothing).
+ *  With `profile` (the caller passes the trusted task, CR5), a target past PLAN is clamped to PLAN unless the plan gate is
+ *  satisfied now, so a forged phase can never skip plan_approval. */
+export function resume(task: Task, at: string, profile?: Profile): Task {
   if (task.phase !== 'PAUSED') return task
   const recorded = task.paused_from
   const hasTarget = recorded !== null && isActivePhase(recorded)
-  const target: ActivePhase = hasTarget ? recorded : 'INTAKE'
-  const reason = hasTarget ? 'resumed' : 'resumed (the phase to return to was missing; restarting at INTAKE)'
+  let target: ActivePhase = hasTarget ? recorded : 'INTAKE'
+  let reason = hasTarget ? 'resumed' : 'resumed (the phase to return to was missing; restarting at INTAKE)'
+  if (profile !== undefined && (target === 'IMPLEMENT' || target === 'VALIDATE') && !checkPlanGate(task, 'user', profile).ok) {
+    reason = `resumed in PLAN instead of ${target}: the plan has no valid approval`
+    target = 'PLAN'
+  }
   return {
     ...task,
     phase: target,
     paused_from: null,
     transitions: [...task.transitions, { from: 'PAUSED', to: target, actor: 'user', reason, at }],
+    next_action: target === recorded || recorded === null ? task.next_action : defaultNextAction(target),
     updated_at: at,
   }
 }

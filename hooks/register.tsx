@@ -39,8 +39,11 @@ const PANE_ID = 'ewm'
 const PANE_TITLE = 'Engineering Workflow'
 const COMMAND_HINT = '<new|resume|status|map|questions|plan|pause|approve|reject|list|help> [args]'
 
-/** D13: only a person (or the script that drives a headless run) may approve or reject a gate. */
+/** D13, D19: only a person (or the script that drives a headless run) may change workflow state. */
 const HUMAN_ORIGINS: readonly string[] = ['composer', 'bridge', 'sdk']
+
+/** CR6: the /ewm commands that change state. status, map, questions, list and help are read-only and work from any origin. */
+const STATE_CHANGING_COMMANDS: readonly string[] = ['new', 'resume', 'pause', 'plan', 'approve', 'reject']
 
 const GATE_LABELS: Record<string, string> = { plan_approval: 'plan approval', done_acceptance: 'done acceptance' }
 
@@ -125,18 +128,33 @@ async function agentTypeOf($: EngineInterface, agentId: string | undefined): Pro
   return agents.find(agent => agent.id === agentId)?.type ?? null
 }
 
-/** Where a write tool would really land: the file's own real path, else its folder's real path plus the name (D14). */
+/**
+ * Where a write tool would really land (D14, CR17): the real path of the nearest ancestor that exists, plus the segments below it
+ * (so `mkdir -p`-style writes of new nested files resolve too, and `..` below the existing part is folded). Undefined when nothing
+ * resolves (a dangling link, no ancestor), which the guard treats as a denial.
+ */
 async function resolveWritePath($: EngineInterface, root: string, input: Record<string, unknown>): Promise<string | undefined> {
   const raw = input.file_path ?? input.notebook_path
   if (typeof raw !== 'string' || raw === '') return undefined
-  const path = raw.startsWith('/') ? raw : joinPath(root, raw)
-  const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-  if (own !== undefined) return own.realPath
-  const cut = path.lastIndexOf('/')
-  const name = path.slice(cut + 1)
-  if (name === '' || name === '.' || name === '..') return undefined
-  const folder = await $.fs.stat(cut <= 0 ? '/' : path.slice(0, cut), { resolve: true }).catch(() => undefined)
-  return folder?.realPath === undefined ? undefined : joinPath(folder.realPath, name)
+  let current = raw.startsWith('/') ? raw : joinPath(root, raw)
+  const below: string[] = []
+  for (;;) {
+    const stat = await $.fs.stat(current, { resolve: true }).catch(() => undefined)
+    if (stat !== undefined) {
+      if (stat.realPath === undefined) return undefined
+      const parts = stat.realPath.split('/').filter(part => part !== '')
+      for (const segment of below) {
+        if (segment === '' || segment === '.') continue
+        if (segment === '..') parts.pop()
+        else parts.push(segment)
+      }
+      return `/${parts.join('/')}`
+    }
+    if (current === '/' || current === '') return undefined
+    const cut = current.lastIndexOf('/')
+    below.unshift(current.slice(cut + 1))
+    current = cut <= 0 ? '/' : current.slice(0, cut)
+  }
 }
 
 /** The deny reason for a tool call, or null to let it through. Throws when the guard cannot decide (the caller fails closed). */
@@ -159,8 +177,8 @@ async function judgeToolCall($: EngineInterface, e: { tool: string; agentId?: st
   return verdict.reason
 }
 
-function refusedApproval(command: string): string {
-  return `ewm: /ewm ${command} is refused from this origin. Gates are decided by a person: ask them to type /ewm ${command} in their prompt.`
+function refusedCommand(command: string): string {
+  return `ewm: /ewm ${command} is refused from this origin. Only a person decides gates and changes the workflow state: ask them to type /ewm ${command} in their prompt.`
 }
 
 /** Finishes a command: refresh the views, open the pane, queue the kickoff and shape the reply. */
@@ -172,12 +190,12 @@ async function settle($: EngineInterface, ctx: Ctx, out: CommandOutput): Promise
   return out.context === undefined ? { text: out.text } : { text: out.text, context: out.context }
 }
 
-/** The Approve button: same use case as /ewm approve, recorded as `via: 'pane'`. */
-async function approveFromPane($: EngineInterface): Promise<void> {
+/** The Approve button: same use case as /ewm approve, recorded as `via: 'pane'`. It carries the hash of the plan that was drawn, so a plan replaced since is refused. */
+async function approveFromPane($: EngineInterface, planHash: string | undefined): Promise<void> {
   await safely(async () => {
     const ctx = await ctxOf($)
     if (ctx === null) return
-    const out = await runCommand(ctx, 'approve', 'pane')
+    const out = await runCommand(ctx, planHash === undefined ? 'approve' : `approve --plan ${planHash}`, 'pane')
     if (out.changed) await refresh($, ctx)
     await update($, NOTICE, () => out.text.split('\n')[0] ?? '')
     queueKickoff($, out.kickoff)
@@ -202,8 +220,8 @@ export const register: Register = on => {
     const ctx = await ctxOf($)
     if (ctx === null) return { text: 'ewm: the workspace root is not known yet. Start a new session in the project folder and try again.' }
     const parsed = parseCommand(e.args)
-    if ('name' in parsed && (parsed.name === 'approve' || parsed.name === 'reject') && !HUMAN_ORIGINS.includes(e.origin.kind)) {
-      return { text: refusedApproval(parsed.name) }
+    if ('name' in parsed && STATE_CHANGING_COMMANDS.includes(parsed.name) && !HUMAN_ORIGINS.includes(e.origin.kind)) {
+      return { text: refusedCommand(parsed.name) }
     }
     return settle($, ctx, await runCommand(ctx, e.args, 'command'))
   }).catch(() => ({ text: 'ewm: the command failed unexpectedly. Run /ewm status to see where the task stands.' }))
@@ -310,8 +328,11 @@ export const register: Register = on => {
               `Next: ${view.next_action}`,
             ]
 
+    const shownPlan = view.plan
+    const approvePlanHash = shownPlan === null || shownPlan === undefined ? undefined : shownPlan.hash
     return (
       <Box flexDirection="column">
+        <Text dimColor>Project: {view.project}</Text>
         <Text bold>
           {view.task_id} · {view.phase} · {view.title}
         </Text>
@@ -324,6 +345,11 @@ export const register: Register = on => {
             <Text>{line}</Text>
           ))}
         </Box>
+        {shownPlan != null && (
+          <Text>
+            Plan {shownPlan.hash.slice(0, 8)} · {shownPlan.steps} step{shownPlan.steps === 1 ? '' : 's'}: {shownPlan.summary}
+          </Text>
+        )}
         {view.pending_gate !== null && (
           <Text color="warning">
             Waiting for your {GATE_LABELS[view.pending_gate] ?? view.pending_gate}: press Approve or run /ewm approve.
@@ -334,7 +360,7 @@ export const register: Register = on => {
           <Button key="overview" label="Overview" hotkey="o" onPress={() => update($, SECTION, () => 'overview' as const)} />
           <Button key="map" label="Map" hotkey="m" onPress={() => update($, SECTION, () => 'map' as const)} />
           <Button key="questions" label="Questions" hotkey="q" onPress={() => update($, SECTION, () => 'questions' as const)} />
-          {view.pending_gate !== null && <Button key="approve" label="Approve" hotkey="a" variant="primary" onPress={() => approveFromPane($)} />}
+          {view.pending_gate !== null && <Button key="approve" label="Approve" hotkey="a" variant="primary" onPress={() => approveFromPane($, approvePlanHash)} />}
         </Box>
       </Box>
     )
