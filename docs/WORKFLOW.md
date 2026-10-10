@@ -80,3 +80,28 @@ output before release.
 - [ ] README install line: `/plugin install ewm --marketplace esola-thomas/claude_code_engineering_workflow_mod`
 - [ ] CHANGELOG entry for 0.0.0
 - [ ] PR merged, CI green, tag `v0.0.0`
+
+## Results (v0.0.0)
+
+Three workflow runs: Build (11 agents), Harden (58 agents, resumed once from
+cache after a container restart) and Polish (3 agents). About 7.8M subagent
+tokens in total, all on Sonnet and Haiku; the orchestrator wrote the
+contracts and test support only (`src/types.ts`, `tests/support/*`, docs).
+
+| ID | Result |
+|---|---|
+| M1 | 1323 / 1323 unit tests pass |
+| M2 | 33 / 33 engine tests pass |
+| M3 | `claude plugin validate .` passes with no warnings |
+| M4 | 0 type errors in both configs against the 2.1.296 declarations |
+| M5 | 80 exports audited; one engine-forced deviation (`engineIo` takes a source object, since the engine refuses `$` passed across an import), contract updated |
+| M6 | Every edge and non-edge asserted; 23 targeted mutants of the controller, 22 killed, 1 equivalent |
+| M7 | 547+ policy tests at Run 1 (grown since), 113 mutants of `policies.ts` all killed, plus a differential fuzzer that runs classified commands in real bash with stubbed programs |
+| M8 | AC1-AC6 covered by service-level and engine tests, and passed live twice (before and after hardening; $0.76 and $0.57 of model spend) |
+| M9 | 42 review findings, 34 confirmed by refute-by-default skeptics, all fixed or closed by design (D14, D18: gates never read model-writable files) |
+| M10 | Engine test: no active task, no file reads, every call passes, tools deferred |
+| M11 | Live: `ewm:repo-scout` and `ewm:docs-scout` ran on `claude-haiku-5-5`, routed from `models.search: haiku` |
+| M12 | Unit test on a large task: resume brief <= 180 words |
+| M13 | Implementation, tests, fixes and docs by Sonnet/Haiku workers |
+| M14 | Forged approvals/validations and edited `paused_from` do not move a gate (unit, engine and live) |
+| M15 | Concurrent spawn/finding/usage writes all persist (unit test) |
