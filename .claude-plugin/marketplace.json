@@ -1,0 +1,12 @@
+{
+  "name": "ewm",
+  "description": "Engineering Workflow Mod (ewm) for Claude Code",
+  "owner": { "name": "esola-thomas" },
+  "plugins": [
+    {
+      "name": "ewm",
+      "source": "./",
+      "description": "Engineering Workflow Mod for Claude Code"
+    }
+  ]
+}

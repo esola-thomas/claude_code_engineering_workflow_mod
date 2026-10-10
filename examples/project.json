@@ -1,0 +1,27 @@
+{
+  "profile_id": "orders-api",
+  "name": "Orders API",
+  "repositories": ["."],
+  "domains": ["orders", "payments"],
+  "entrypoints": ["README.md", "docs/", "src/server.ts"],
+  "policies": {
+    "external_network": "deny_by_default",
+    "require_plan_approval": true,
+    "allow_write_in_explore": false,
+    "allowed_mcp_tools": ["mcp__github__issue_read", "mcp__github__pull_request_read"]
+  },
+  "models": {
+    "lead": "opus",
+    "search": "haiku",
+    "reviewer": "sonnet"
+  },
+  "budgets": {
+    "max_parallel_researchers": 3,
+    "max_research_rounds_without_user_update": 2,
+    "max_findings_per_scout": 8
+  },
+  "validation": {
+    "commands": ["npm test", "npm run lint"],
+    "timeout_ms": 300000
+  }
+}
