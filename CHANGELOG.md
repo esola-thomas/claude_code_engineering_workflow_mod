@@ -4,11 +4,14 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.0.0] - 2026-10-09
+## [0.0.0] - 2026-10-10
 
 ### Added
 
-- `/ewm` command with `new`, `resume`, `status`, `map`, `questions`, `plan`, `pause`, `approve`, `reject`, `list` and `help`.
+- `/ewm` command with `new`, `resume`, `status`, `map`, `questions`, `plan`, `pause`, `approve`, `reject`, `reset`, `list` and `help`.
+- `/ewm reset` (human origins only): saves the gate ledger to `.ewm/ledger-backup-<time>.json` and starts an empty one, the way out of a malformed ledger. A task without a ledger entry then resumes with no approvals or validation runs, at PLAN at most, with the transition reason "ledger reset: gates must be approved again"; a DONE task is not resumed.
+- While a gate waits for you, status, the pane and the resume brief show "Review the plan and run /ewm approve ..." or "Review the validation results and run /ewm approve to accept closure ..." as the next action.
+- `/ewm status` explains an active task whose files are gone and the two ways out (`/ewm list`, `/ewm new`).
 - Task workflow: INTAKE, EXPLORE, UNDERSTAND, PLAN, IMPLEMENT, VALIDATE and DONE, plus PAUSED, which resumes in the phase it was paused from.
 - Two human gates: plan approval (PLAN to IMPLEMENT) and acceptance (VALIDATE to DONE). The approval of a plan is bound to the plan's hash.
 - Model tools `mcp__ewm__status`, `set_intake`, `advance`, `record_finding`, `question`, `decision`, `set_plan`, `update_step`, `write_map` and `run_validation`.
@@ -34,6 +37,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Read-only subagents cannot edit, even in IMPLEMENT, and may call only `mcp__ewm__status`.
 - `.ewm/` cannot be written by the model. Gate state lives in a mod-private ledger that the model's tools cannot write.
 - Approvals come only from a human origin. The model has no approve tool.
+- A task folder deleted while the ledger names the task as active does not switch the guard off or deny every call without a hint: the guard enforces the ledger phase and every denial says how to get out.
+- The time a task entered VALIDATE, which decides which validation runs count for acceptance, is kept in the ledger, not read from `task.json`, so editing the task file cannot make an old pass look fresh. A ledger from before this change counts no run until validation is run again.
 - Validation runs only exact commands from `validation.commands`, with no shell. Destructive or network commands never run.
 - Secrets are redacted in audit lines, validation commands and validation output.
 - Task ids must match `TASK-NNN` before they are used in a path.
@@ -50,8 +55,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The mod API is early access. v0.0.0 targets Claude Code 2.1.296 and must be re-checked on each upgrade with `npm run check`.
 - Not in v0.0.0: quick and adaptive modes, automatic model escalation, multi-repository and monorepo detection, ticket and CI adapters, Verdi and UVM introspection.
 - Observed in the live acceptance run (`docs/ACCEPTANCE.md`):
-  - Deleting `.ewm/` does not reset the gate ledger, so a stale entry can block `/ewm new` until it is removed by hand (observation 1).
-  - In headless `claude -p`, `/ewm approve` can return without starting the IMPLEMENT turn (observation 2).
+  - Deleting `.ewm/` does not reset the gate ledger, so a stale or malformed entry blocks `/ewm new` until you run `/ewm reset` (observation 1).
+  - In headless `claude -p` runs the follow-up turn after a command is best effort; send a follow-up prompt if none starts. `/ewm approve` can return without starting the IMPLEMENT turn (observation 2).
   - A compound read-only Bash loop in EXPLORE can be refused as not read-only; use Read, Grep and Glob instead (observation 3).
   - No gate forces the `ewm:reviewer` diff review before VALIDATE. `handoff.md` records whether it ran (observation 4).
 

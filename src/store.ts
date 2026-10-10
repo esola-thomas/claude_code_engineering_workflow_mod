@@ -2,8 +2,8 @@
 // task.json and artifact files, the audit log, secret redaction, and the
 // mod-private ledger that gate checks trust instead of task.json (D14).
 
-import { ACTIVE_PHASES, ARTIFACT_NAMES, EwmError, PHASES, TASK_ID_PATTERN } from './types.ts'
-import type { ArtifactName, AuditEntry, Io, Ledger, LedgerEntry, LedgerValidation, Phase, Profile, Task, TaskSummary } from './types.ts'
+import { ACTIVE_PHASES, ARTIFACT_NAMES, EwmError, PHASES, TASK_ID_PATTERN, unprefixed } from './types.ts'
+import type { ArtifactName, AuditEntry, Io, Ledger, LedgerEntry, LedgerValidation, Phase, Profile, Task, TaskSummary, TrustedTask } from './types.ts'
 
 export const EWM_DIR = '.ewm'
 
@@ -49,8 +49,9 @@ function compareTaskIds(a: string, b: string): number {
   return taskNumber(a) - taskNumber(b)
 }
 
+/** The reason inside a message that starts with "ewm: " itself: the cause's own prefix is dropped so it appears once (F4). */
 function describeError(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause)
+  return unprefixed(cause instanceof Error ? cause.message : String(cause))
 }
 
 /** Ids of the task directories on disk. Only a missing tasks/ folder counts as empty; other failures surface. */
@@ -323,7 +324,8 @@ export function ledgerKey(root: string): string {
   return `ledger:${root}`
 }
 
-function emptyLedger(root: string): Ledger {
+/** A ledger for `root` with no active task and no entries. */
+export function emptyLedger(root: string): Ledger {
   return { version: 1, root, active_task: null, tasks: {} }
 }
 
@@ -391,6 +393,7 @@ function entryProblem(entry: unknown): string | null {
   }
   if (!Array.isArray(entry.approvals) || !entry.approvals.every(isApproval)) return 'approvals is not a list of approval records'
   if (!Array.isArray(entry.validations) || !entry.validations.every(isLedgerValidation)) return 'validations is not a list of validation records'
+  if (entry.validating_since !== undefined && entry.validating_since !== null && typeof entry.validating_since !== 'string') return 'validating_since is not a time or null'
   if (!isProfileSnapshot(entry.profile)) return 'profile snapshot is missing or incomplete'
   if (entry.profile_source !== null && typeof entry.profile_source !== 'string') return 'profile_source is not a string or null'
   return null
@@ -400,7 +403,7 @@ function malformedLedger(root: string, problem: string): EwmError {
   return new EwmError(
     'parse_error',
     `ewm: the gate ledger for ${root} is malformed (${problem}), so no gate can be checked and the policy guard fails closed. ` +
-      `Tell the person: clear the mod store entry "${ledgerKey(root)}" (recorded approvals are lost), then run /ewm new or /ewm resume.`,
+      'Ask the person to run /ewm reset: it saves a backup of the ledger under .ewm/ and starts an empty one (tasks on disk are kept; their gates must be approved again), then /ewm resume <id> or /ewm new.',
   )
 }
 
@@ -434,6 +437,25 @@ export async function saveLedger(io: Io, root: string, ledger: Ledger): Promise<
   await io.kvSet(ledgerKey(root), ledger)
 }
 
+/**
+ * Recovery for a malformed ledger, or a fresh start (F2). Saves whatever the store holds under the ledger key, even a malformed value,
+ * to <root>/.ewm/ledger-backup-<`at` with ':' replaced by '-'>.json, then stores an empty ledger (no active task). Task files are untouched.
+ * `at` is an ISO time (the caller reads the clock). Returns the backup's absolute path.
+ */
+export async function resetLedger(io: Io, root: string, at: string): Promise<{ backup: string }> {
+  const raw = await io.kvGet(ledgerKey(root))
+  let text: string
+  try {
+    text = JSON.stringify(raw === undefined ? null : raw, null, 2) ?? 'null'
+  } catch {
+    text = JSON.stringify(String(raw))
+  }
+  const backup = joinPath(root, EWM_DIR, `ledger-backup-${at.replace(/:/g, '-')}.json`)
+  await io.writeText(backup, `${text}\n`)
+  await saveLedger(io, root, emptyLedger(root))
+  return { backup }
+}
+
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
@@ -461,8 +483,10 @@ export function updateLedgerEntry(
  * and validations are kept only when the ledger holds the same id with the same exit code, taking `ok`, `at` and the
  * command from the ledger. Nothing the task file claims about gates or phase is believed. Gate checks use this.
  * Without an entry nothing is approved and the task cannot be past PLAN.
+ * `validating_since` (F5) is the ledger entry's, and only that: whatever task.json says about it, and its `transitions`, are not believed.
+ * An entry without the field (an older ledger) yields none, so no validation counts as fresh until the mod records a new run.
  */
-export function trustedTask(task: Task, entry: LedgerEntry | undefined): Task {
+export function trustedTask(task: Task, entry: LedgerEntry | undefined): TrustedTask {
   const approvals = entry === undefined ? [] : entry.approvals.map(approval => ({ ...approval }))
   const recorded: readonly LedgerValidation[] = entry?.validations ?? []
   const validations: Task['validations'] = []
@@ -470,11 +494,14 @@ export function trustedTask(task: Task, entry: LedgerEntry | undefined): Task {
     const known = recorded.find(candidate => candidate.id === run.id && candidate.exit_code === run.exit_code)
     if (known !== undefined) validations.push({ ...run, ok: known.ok, at: known.at, command: known.command })
   }
+  const { validating_since: _untrusted, ...base } = task as TrustedTask
+  const since = entry?.validating_since
+  const marker: { validating_since?: string } = typeof since === 'string' ? { validating_since: since } : {}
   if (entry === undefined) {
     const pastPlan = (phase: Phase | null): boolean => phase === 'IMPLEMENT' || phase === 'VALIDATE' || phase === 'DONE'
     const phase: Phase = pastPlan(task.phase) ? 'PLAN' : task.phase
     const pausedFrom = task.paused_from !== null && pastPlan(task.paused_from) ? 'PLAN' : task.paused_from
-    return { ...task, phase, paused_from: pausedFrom, approvals, validations }
+    return { ...base, phase, paused_from: pausedFrom, approvals, validations, ...marker }
   }
-  return { ...task, phase: entry.phase, paused_from: entry.paused_from, approvals, validations }
+  return { ...base, phase: entry.phase, paused_from: entry.paused_from, approvals, validations, ...marker }
 }

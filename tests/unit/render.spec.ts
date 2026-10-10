@@ -408,7 +408,8 @@ describe('renderStatus', () => {
     const many = Array.from({ length: 40 }, (_, i) => `model-${i} (ewm:agent x1)`)
     const task = makeLargeTask()
     const messy = { ...task, title: 'A title\nwith\nbreaks', next_action: 'Line one\n\nline two' }
-    const text = renderStatus(messy, profile, { pending: 'done_acceptance', planApproved: true, models: many })
+    // No gate is pending here: a pending gate replaces next_action with its own sentence (F3, see the nextActionOf tests).
+    const text = renderStatus(messy, profile, { pending: null, planApproved: true, models: many })
     assert.ok(lineCount(text) <= 20, `${lineCount(text)} lines`)
     assert.match(text, /\+35 more/)
     assert.match(text, /Task: TASK-001 - A title with breaks/)

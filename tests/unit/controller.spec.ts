@@ -16,7 +16,7 @@ import {
   transition,
 } from '../../src/controller.ts'
 import { ACTIVE_PHASES, EwmError, PHASES } from '../../src/types.ts'
-import type { Actor, Approval, GateName, Phase, Plan, PlanStep, Task, ValidationRun } from '../../src/types.ts'
+import type { Actor, Approval, GateName, Phase, Plan, PlanStep, Task, TrustedTask, ValidationRun } from '../../src/types.ts'
 import { AT, deepFreeze, makeProfile, makeTask } from '../support/fixtures.ts'
 
 const LATER = '2026-10-09T18:00:00.000Z'
@@ -77,12 +77,14 @@ function planApproval(plan: Plan, decision: 'approved' | 'rejected' = 'approved'
   return approval('plan_approval', decision, { plan_hash: planHash(plan) })
 }
 
-function frozenTask(overrides: Partial<Task> = {}): Task {
-  return deepFreeze(makeTask(overrides))
+/** F5: freshness comes from `validating_since`, which store.trustedTask takes from the ledger in production. A task in VALIDATE defaults to "entered at AT", so runs recorded at AT count. */
+function frozenTask(overrides: Partial<TrustedTask> = {}): TrustedTask {
+  const marker = overrides.phase === 'VALIDATE' && !('validating_since' in overrides) ? { validating_since: AT } : {}
+  return deepFreeze(makeTask({ ...marker, ...overrides } as Partial<Task>)) as TrustedTask
 }
 
 /** A task in `phase` with every gate prerequisite satisfied: plan, plan approval, validation, acceptance. */
-function readyTask(phase: Phase, overrides: Partial<Task> = {}): Task {
+function readyTask(phase: Phase, overrides: Partial<TrustedTask> = {}): TrustedTask {
   const plan = makePlan()
   return frozenTask({
     phase,
@@ -881,7 +883,7 @@ describe('defaultNextAction', () => {
 describe('lifecycle', () => {
   it('walks INTAKE to DONE, stopping at both gates until a human approves', () => {
     const plan = makePlan()
-    let task = frozenTask()
+    let task: TrustedTask = frozenTask()
     const step = (to: Phase, actor: Actor = 'model') => {
       task = deepFreeze(transition(task, to, actor, `to ${to}`, LATER, strict))
     }
@@ -905,6 +907,8 @@ describe('lifecycle', () => {
     assert.equal(pendingGate(task, strict), null)
     step('IMPLEMENT')
     step('VALIDATE')
+    // The service records the entry into VALIDATE in the ledger (commitState); trustedTask hands it back as validating_since (F5).
+    task = deepFreeze({ ...task, validating_since: LATER })
     assert.equal(pendingGate(task, strict), null, 'no validation run yet')
     assertEwmError(() => step('DONE'), 'gate_required')
 
@@ -956,12 +960,12 @@ describe('lifecycle', () => {
 // Hardening: CR9 (fresh, passing validation), CR10 (person-only UNDERSTAND > PLAN), resume clamp (CR5)
 // ---------------------------------------------------------------------------
 
-describe('CR9: acceptance needs a passing validation recorded since entering VALIDATE', () => {
+describe('CR9, F5: acceptance needs a passing validation recorded since entering VALIDATE (the ledger\'s validating_since)', () => {
   const entered = (at: string) => ({ from: 'IMPLEMENT', to: 'VALIDATE', actor: 'model', reason: 'steps done', at }) as const
   const EARLIER = '2026-10-09T16:00:00.000Z'
 
   it('a failing run opens no gate and blocks DONE with a reason that says why', () => {
-    const task = readyTask('VALIDATE', { validations: [makeValidation({ ok: false, exit_code: 1 })], approvals: [planApproval(makePlan())], transitions: [entered(AT)] })
+    const task = readyTask('VALIDATE', { validations: [makeValidation({ ok: false, exit_code: 1 })], approvals: [planApproval(makePlan())], validating_since: AT })
     assert.equal(pendingGate(task, strict), null)
     assertRejected(checkTransition(task, 'DONE', 'user', strict), /passing validation run/)
     assertEwmError(() => recordApproval(task, 'done_acceptance', 'approved', 'command', LATER, strict), 'invalid_input', /no passing validation run/)
@@ -971,7 +975,7 @@ describe('CR9: acceptance needs a passing validation recorded since entering VAL
     const task = readyTask('VALIDATE', {
       validations: [makeValidation({ at: EARLIER })],
       approvals: [planApproval(makePlan())],
-      transitions: [entered(EARLIER), { from: 'VALIDATE', to: 'IMPLEMENT', actor: 'model', reason: 'rewrite', at: AT }, { ...entered(LATER) }],
+      validating_since: LATER,
     })
     assert.equal(pendingGate(task, strict), null)
     assertRejected(checkTransition(task, 'DONE', 'user', strict), /code changed after the last pass/)
@@ -981,7 +985,7 @@ describe('CR9: acceptance needs a passing validation recorded since entering VAL
     const task = readyTask('VALIDATE', {
       validations: [makeValidation({ at: LATER })],
       approvals: [planApproval(makePlan())],
-      transitions: [entered(AT)],
+      validating_since: AT,
     })
     assert.equal(pendingGate(task, strict), 'done_acceptance')
   })
@@ -990,10 +994,39 @@ describe('CR9: acceptance needs a passing validation recorded since entering VAL
     const task = readyTask('VALIDATE', {
       validations: [makeValidation({ ok: false, exit_code: 1 }), makeValidation({ id: 'V-002', at: LATER })],
       approvals: [planApproval(makePlan())],
-      transitions: [entered(AT)],
+      validating_since: AT,
     })
     assert.equal(freshValidations(task).map(run => run.id).join(), 'V-002')
     assert.equal(pendingGate(task, strict), 'done_acceptance')
+  })
+
+  it('equal timestamps count as fresh', () => {
+    const task = readyTask('VALIDATE', { validations: [makeValidation({ at: LATER })], validating_since: LATER })
+    assert.equal(freshValidations(task).length, 1)
+  })
+
+  it('F5: without validating_since (an older ledger) nothing is fresh, whatever task.transitions claims', () => {
+    const task = readyTask('VALIDATE', {
+      validations: [makeValidation({ at: LATER })],
+      approvals: [planApproval(makePlan())],
+      transitions: [entered(EARLIER)],
+      validating_since: undefined,
+    })
+    assert.deepEqual(freshValidations(task), [])
+    assert.equal(pendingGate(task, strict), null)
+    assertRejected(checkTransition(task, 'DONE', 'user', strict), /passing validation run/)
+    assertEwmError(() => recordApproval(task, 'done_acceptance', 'approved', 'command', LATER, strict), 'invalid_input', /no passing validation run/)
+    // null is the ledger's "left VALIDATE": the same.
+    assert.deepEqual(freshValidations({ ...task, validating_since: null }), [])
+  })
+
+  it('F5: task.transitions cannot make an old pass look fresh, or a fresh one stale', () => {
+    // A model that rewrites transitions in task.json to claim an early entry gains nothing: the ledger's marker is later than the pass.
+    const forged = readyTask('VALIDATE', { validations: [makeValidation({ at: EARLIER })], transitions: [entered('2000-01-01T00:00:00.000Z')], validating_since: LATER })
+    assert.deepEqual(freshValidations(forged), [])
+    // And a late entry in transitions does not hide a pass the ledger says is fresh.
+    const honest = readyTask('VALIDATE', { validations: [makeValidation({ at: LATER })], transitions: [entered('2999-01-01T00:00:00.000Z')], validating_since: AT })
+    assert.equal(freshValidations(honest).length, 1)
   })
 })
 

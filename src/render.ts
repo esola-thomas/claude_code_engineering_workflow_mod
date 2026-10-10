@@ -152,6 +152,14 @@ function mapLinesOf(task: Task): string[] {
   return lines.length > 0 ? lines.map(line => line.trimEnd()) : [...map.components]
 }
 
+/** What to do next in the words of the pending gate (F3), else the task's stored next_action. With a plan or the validation results waiting
+ *  for the person, "write the plan" would be wrong: the next step is theirs. `gate` is the trusted GateState; without it the stored sentence stands. */
+export function nextActionOf(task: Task, gate?: GateState): string {
+  if (gate?.pending === 'plan_approval') return 'Review the plan and run /ewm approve (or /ewm reject <reason>)'
+  if (gate?.pending === 'done_acceptance') return 'Review the validation results and run /ewm approve to accept closure (or /ewm reject <reason>)'
+  return task.next_action
+}
+
 /** counts.components = task.system_map.components.length (0 when null); sources = distinct evidence paths; risks = plan risks; stale = stale findings. map_lines = text_map lines (else components); question_lines = open questions "Q-001 text"; models = gate.models. */
 export function paneModel(task: Task, profile: Profile, gate: GateState): PaneModel {
   return {
@@ -165,7 +173,7 @@ export function paneModel(task: Task, profile: Profile, gate: GateState): PaneMo
     models: gate.models.map(oneLine),
     pending_gate: gate.pending,
     plan: gate.pending === 'plan_approval' && gate.plan != null ? { hash: gate.plan.hash, steps: gate.plan.steps, summary: oneLine(gate.plan.summary) } : null,
-    next_action: oneLine(task.next_action),
+    next_action: oneLine(nextActionOf(task, gate)),
     map_lines: mapLinesOf(task).map(stripControls),
     question_lines: openQuestions(task).map(question => `${question.id} ${oneLine(question.text)}`),
   }
@@ -219,7 +227,7 @@ export function renderStatus(task: Task | null, profile: Profile, gate: GateStat
     `Components: ${counts.components} | Sources: ${counts.sources} | Open questions: ${counts.open_questions} | Risks: ${counts.risks} | Findings: ${counts.findings} | Stale: ${counts.stale}`,
     ...modelLines(pane.models),
     gateLine(gate),
-    `Next: ${oneLine(task.next_action)}`,
+    `Next: ${oneLine(nextActionOf(task, gate))}`,
   ].join('\n')
 }
 
@@ -516,6 +524,6 @@ export function renderResumeBrief(task: Task, staleness: Staleness, gate?: GateS
     ...decisionLines(task),
     ...questionLines(task),
     stalenessLine(task, staleness),
-    `Next: ${clipWords(task.next_action, BRIEF_NEXT_WORDS)}`,
+    `Next: ${clipWords(nextActionOf(task, gate), BRIEF_NEXT_WORDS)}`,
   ].join('\n')
 }

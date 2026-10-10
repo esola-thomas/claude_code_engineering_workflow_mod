@@ -60,6 +60,8 @@ decision. None changes the product promise.
 | D18 | Phase integrity | The task's phase and resume target live in the ledger too; task.json mirrors them. | While PAUSED the mod is inert, so the model could otherwise edit `paused_from` and skip the plan gate on resume. | Yes |
 | D19 | Who may change state | Every state-changing `/ewm` command needs a human origin, not only approve/reject. | A scheduled or model-originated `/ewm resume` must not reload a model-edited profile. | Yes |
 | D20 | Readiness to plan | UNDERSTAND -> PLAN is the person's call (`/ewm plan`), as SPEC §4 labels it ("usuario listo"). The live run showed the model jumping to PLAN on its own. | Principle 1. | Yes |
+| D21 | Ledger recovery | `/ewm reset` (human origins only, D19) saves the raw ledger value to `<root>/.ewm/ledger-backup-<time>.json` and stores an empty ledger. Tasks on disk are kept; a task with no ledger entry resumes with no approvals or validations, at PLAN at most, and a DONE task is not resumed. | A malformed or stale ledger fails closed (D14); without a command the only way out was editing the mod store by hand. | Yes |
+| D22 | Missing task files | While the ledger names an active task whose files are unreadable, the guard enforces the ledger phase and appends how to get out (`/ewm status`, `/ewm list`) to every denial. | A deleted task folder must neither disable the policy nor deny every call without explanation. | Yes |
 | D13 | Approval origin | `/ewm approve` is accepted only from `composer`, `bridge` or `sdk` origins, or a pane button press. A plugin, peer, trigger or notification origin is refused. | Keeps approvals human. `sdk` is needed for headless runs; a headless caller is the human's script. | Yes |
 
 ## Known limits (accepted for v0.0.0)
@@ -72,6 +74,7 @@ decision. None changes the product promise.
 - `max_parallel_researchers` is enforced at spawn only when the engine reports which agents are still running; otherwise it is a skill instruction.
 - Write serialization is per process. Two Claude Code sessions driving the same workspace at once can still interleave writes to one task; run one session per task.
 - Task files are written whole, without atomic rename (the `$.fs` API has none). A crash mid-write can corrupt one `task.json`; artifacts are re-renderable from it.
+- In headless `claude -p` runs the follow-up turn after a command is best effort; send a follow-up prompt if none starts.
 - The mod API is early access. v0.0.0 targets Claude Code 2.1.296 and must be re-validated on upgrades (`npm run check`).
 - Monorepo detection, multi-repo, ticket/CI adapters, Verdi/UVM introspection: out of scope per SPEC §9.
 

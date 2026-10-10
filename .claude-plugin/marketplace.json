@@ -1,5 +1,6 @@
 {
   "name": "ewm",
+  "description": "Engineering Workflow Mod (ewm) for Claude Code",
   "owner": { "name": "esola-thomas" },
   "plugins": [
     {

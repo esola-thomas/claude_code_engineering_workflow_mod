@@ -223,6 +223,13 @@ export type Task = {
   updated_at: string
 }
 
+/**
+ * A Task as the gates see it (`store.trustedTask`): phase, approvals and validations from the ledger, plus `validating_since`, the ISO time
+ * of the latest entry into VALIDATE as the LEDGER recorded it (F5). It is never read from task.json, where the model could rewrite
+ * `transitions`; absent or null means "no validation counts as fresh yet". Plain Tasks are assignable (the field is optional).
+ */
+export type TrustedTask = Task & { validating_since?: string | null }
+
 export type TaskSummary = {
   id: string
   title: string
@@ -400,6 +407,16 @@ export class EwmError extends Error {
     this.code = code
     this.name = 'EwmError'
   }
+}
+
+/** The prefix every message to the person or model starts with, exactly once. */
+export const EWM_PREFIX = 'ewm: '
+
+/** `text` without a leading "ewm: " (any number of them), for wrapping a message in another one or for a host that prefixes the plugin name itself (F4). */
+export function unprefixed(text: string): string {
+  let rest = text
+  while (rest.startsWith(EWM_PREFIX)) rest = rest.slice(EWM_PREFIX.length)
+  return rest
 }
 
 export type EwmErrorCode =

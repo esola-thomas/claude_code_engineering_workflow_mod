@@ -28,7 +28,7 @@ Rules for everything under `src/`:
 - Imports use explicit `.ts` suffixes and `import type` for types (`verbatimModuleSyntax`).
 - Erasable TypeScript only (no enums, namespaces, parameter properties, decorators).
 - Pure modules never touch `Io`. Functions that "change" a task return a new `Task` (no mutation of inputs).
-- Errors that reach the person or model are `EwmError` with a clear, actionable message prefixed `ewm:`.
+- Errors that reach the person or model are `EwmError` with a clear, actionable message prefixed `ewm:` exactly once (`types.unprefixed` removes a prefix a message already carries before it is wrapped in another).
 - ISO timestamps: `new Date(ms).toISOString()`.
 
 Tests:
@@ -47,6 +47,7 @@ be read from a file the model can write:
 | Profile used by the guard and tools | ledger snapshot | human commands (`new`, `resume`) reload `.ewm/project.yaml` |
 | Approvals | ledger | `/ewm approve`, `/ewm reject`, pane press (human origins only) |
 | Validation runs that count for gates (id, exit code, `ok`, `at`, command) | ledger | `run_validation` (the mod executes the command itself) |
+| When the task last entered VALIDATE (`validating_since`, F5) | ledger | the service, on every saved phase change |
 | Plan hash | recomputed from `task.plan` at check time | never trusted from the stored `hash` field |
 | Everything else (findings, questions, decisions, plan, map, usage) | `task.json` | service |
 
@@ -82,7 +83,7 @@ export type EwmCommand =
   | { name: 'new'; title: string; goal?: string }        // /ewm new "title" [--goal "text"]
   | { name: 'resume'; id?: string }                       // /ewm resume [TASK-001]
   | { name: 'status' } | { name: 'map' } | { name: 'questions' } | { name: 'plan' }
-  | { name: 'pause' } | { name: 'list' } | { name: 'help' }
+  | { name: 'pause' } | { name: 'reset' } | { name: 'list' } | { name: 'help' }  // reset: back up the gate ledger and start an empty one (F2)
   | { name: 'approve'; note?: string; plan?: string }     // /ewm approve [--plan <hash>] [note...]  (plan: lower-case hex prefix, 8-64 digits)
   | { name: 'reject'; note: string }                      // /ewm reject <reason...>  (note required)
 /** Empty input -> status. Unknown sub-command or bad args -> { error } including USAGE. Ids are upper-cased and validated with TASK_ID_PATTERN. */
@@ -114,29 +115,30 @@ export function planHash(plan: Omit<Plan, 'hash' | 'updated_at'>): string
 /** Whether `to` is reachable from task.phase by `actor` now. Rules:
  *  - edge must exist in EDGES (PAUSED/DONE/unknown -> not ok, explain);
  *  - -> IMPLEMENT: task.plan must exist with >= 1 step; if require_plan_approval, hasValidApproval(task,'plan_approval');
- *  - -> DONE: >= 1 passing entry in task.validations recorded since the latest entry into VALIDATE (CR9) AND hasValidApproval(task,'done_acceptance');
+ *  - -> DONE: >= 1 passing entry in task.validations recorded since the ledger's `validating_since` (CR9, F5) AND hasValidApproval(task,'done_acceptance');
  *  - UNDERSTAND -> PLAN: actor must be 'user' (CR10; the model gets a gate_required reason naming /ewm plan);
  *  - reasons name the missing condition and the human action (e.g. "ask the person to run /ewm approve").
  *  The caller passes a task whose approvals/validations are the trusted (ledger) ones. */
-export function checkTransition(task: Task, to: Phase, actor: Actor, profile: Profile): Check
+export function checkTransition(task: TrustedTask, to: Phase, actor: Actor, profile: Profile): Check
 /** Applies a checked transition: phase, transitions[] (+{from,to,actor,reason,at}), next_action (defaultNextAction), updated_at. Throws EwmError('invalid_transition' | 'gate_required'). */
-export function transition(task: Task, to: Phase, actor: Actor, reason: string, at: string, profile: Profile): Task
+export function transition(task: TrustedTask, to: Phase, actor: Actor, reason: string, at: string, profile: Profile): Task
 /** ACTIVE -> PAUSED, sets paused_from, records transition. Throws if PAUSED or DONE. */
 export function pause(task: Task, at: string, reason?: string): Task
 /** PAUSED -> paused_from (records transition, clears paused_from). A non-PAUSED task is returned unchanged.
  *  With `profile` (the service always passes it, on the trusted task), a target of IMPLEMENT or VALIDATE is clamped to PLAN unless the plan gate is
  *  satisfied now (a plan with steps and, when required, a valid approval), so a forged resume target cannot skip plan_approval (CR5). */
-export function resume(task: Task, at: string, profile?: Profile): Task
-/** CR9: the runs that can back an acceptance: ok and recorded (run.at >= the `at` of the latest transition into VALIDATE). */
-export function freshValidations(task: Task): ValidationRun[]
+export function resume(task: TrustedTask, at: string, profile?: Profile): Task
+/** CR9, F5: the runs that can back an acceptance: ok and recorded at or after `task.validating_since`, the ledger's time of the latest entry into VALIDATE
+ *  (carried by `store.trustedTask`; `task.transitions` is NOT read). No `validating_since` (an older ledger, a plain task) -> [] (fail closed). */
+export function freshValidations(task: TrustedTask): ValidationRun[]
 /** The gate a human could act on now, else null:
  *  PLAN with plan (>=1 step), require_plan_approval, no valid approval -> 'plan_approval';
  *  VALIDATE with >= 1 freshValidations and no valid acceptance -> 'done_acceptance'. */
-export function pendingGate(task: Task, profile: Profile): GateName | null
+export function pendingGate(task: TrustedTask, profile: Profile): GateName | null
 /** The latest approval record for the gate is 'approved'; for plan_approval its plan_hash must equal planHash(task.plan) RECOMPUTED now (never the stored task.plan.hash). */
 export function hasValidApproval(task: Task, gate: GateName): boolean
 /** Appends an Approval (by:'user', plan_hash = planHash(task.plan) for plan_approval). Throws EwmError('invalid_input') if gate !== pendingGate(task, profile). */
-export function recordApproval(task: Task, gate: GateName, decision: 'approved' | 'rejected', via: 'command' | 'pane', at: string, profile: Profile, note?: string): Task
+export function recordApproval(task: TrustedTask, gate: GateName, decision: 'approved' | 'rejected', via: 'command' | 'pane', at: string, profile: Profile, note?: string): Task
 /** Default next_action sentence per phase (e.g. EXPLORE: "Delegate bounded searches to ewm scouts and record sourced findings."). */
 export function defaultNextAction(phase: Phase): string
 ```
@@ -186,7 +188,8 @@ export function redactSecrets(text: string): string
 
 // Gate ledger (D14), in Io.kvGet/kvSet under ledgerKey(root).
 export function ledgerKey(root: string): string                       // "ledger:" + root
-/** Missing -> { version: 1, root, active_task: null, tasks: {} }. Present but malformed -> EwmError('parse_error') (the guard then fails closed). */
+/** Missing -> { version: 1, root, active_task: null, tasks: {} }. Present but malformed -> EwmError('parse_error') (the guard then fails closed); its message sends the person to /ewm reset (F2).
+ *  An entry's `validating_since`, when present, must be a string or null. */
 export async function loadLedger(io: Io, root: string): Promise<Ledger>
 export async function saveLedger(io: Io, root: string, ledger: Ledger): Promise<void>
 /** A fresh entry: phase (default INTAKE), paused_from null, no approvals, no validations, a private copy of the profile. */
@@ -195,8 +198,15 @@ export function createLedgerEntry(init: { profile: Profile; profile_source: stri
 export function updateLedgerEntry(ledger: Ledger, id: string, fn: (entry: LedgerEntry) => LedgerEntry, init: { profile: Profile; profile_source: string | null }): Ledger
 /** Pure: the task as the mod trusts it (CR5, CR9). `phase`/`paused_from` come from the ledger entry, approvals are the ledger's, validations are kept only for ledger ids with
  *  matching exit codes and take `ok`, `at` and `command` from the ledger. Without an entry nothing is approved and phase/paused_from are clamped to PLAN at most. Gate checks use this.
- *  `ledgerKey`-stored entries now require `phase` and `paused_from`; a ledger whose `active_task` has no entry is malformed (the guard fails closed). */
-export function trustedTask(task: Task, entry: LedgerEntry | undefined): Task
+ *  `ledgerKey`-stored entries now require `phase` and `paused_from`; a ledger whose `active_task` has no entry is malformed (the guard fails closed).
+ *  Returns a `TrustedTask` (types.ts): `validating_since` (F5) is the ledger entry's value, never task.json's (a key of that name in task.json is dropped); no entry, or an older entry without it, yields none. */
+export function trustedTask(task: Task, entry: LedgerEntry | undefined): TrustedTask
+/** Pure. A ledger for `root` with no active task and no entries. */
+export function emptyLedger(root: string): Ledger
+/** F2, the recovery path behind /ewm reset. Writes the raw value stored under ledgerKey(root) (whatever kvGet returns, even malformed; nothing -> "null") to
+ *  <root>/.ewm/ledger-backup-<`at` with ':' replaced by '-'>.json, THEN stores emptyLedger(root); when the backup cannot be written the ledger is left as it was.
+ *  `at` is an ISO time. Task files are untouched. Returns the backup's absolute path. */
+export async function resetLedger(io: Io, root: string, at: string): Promise<{ backup: string }>
 ```
 
 ## src/policies.ts (pure)
@@ -316,6 +326,9 @@ export type GateState = { pending: GateName | null; planApproved: boolean; model
 export function stripControls(text: string): string
 /** First 8 characters of a plan hash: what the person is shown and may type after `/ewm approve --plan`. */
 export function shortHash(hash: string): string
+/** F3: the next action shown in status, pane and resume brief: while `gate.pending` is 'plan_approval' "Review the plan and run /ewm approve (or /ewm reject <reason>)",
+ *  while 'done_acceptance' "Review the validation results and run /ewm approve to accept closure (or /ewm reject <reason>)", else the stored task.next_action (which is never rewritten). */
+export function nextActionOf(task: Task, gate?: GateState): string
 /** counts.components = task.system_map.components.length (0 when null); sources = distinct evidence paths; risks = plan risks; stale = stale findings.
  *  map_lines = text_map lines (else components); question_lines = open questions "Q-001 text"; models = gate.models; plan = gate.plan while pending_gate is 'plan_approval', else null
  *  (PaneModel.plan = { hash (full), steps, summary }). All model-written text is stripped of control characters. */
@@ -346,9 +359,13 @@ export const TOOL_SPECS: readonly { name: string; description: string; inputSche
 export async function runCommand(ctx: Ctx, args: string, via: 'command' | 'pane'): Promise<CommandOutput>
 /** Runs one model tool by short name (e.g. 'record_finding'). Never throws: errors become { ok: false, text }. */
 export async function runTool(ctx: Ctx, name: string, input: Record<string, unknown>): Promise<ToolOutput>
-/** For the policy guard. Reads the ledger first; returns { task: null, profile: DEFAULT_PROFILE } when no task is active WITHOUT touching any other file.
- *  With an active task: loads task.json and returns the ledger's profile snapshot. A malformed ledger or unreadable active task throws (the guard fails closed). */
-export async function activeContext(ctx: Ctx): Promise<{ task: Task | null; profile: Profile }>
+/** For the policy guard (F1). Reads the ledger first; returns { task: null, profile: DEFAULT_PROFILE, phase: null } when no task is active WITHOUT touching any other file.
+ *  With an active task `phase` is the LEDGER phase and `profile` the ledger's snapshot; `task` is task.json (or task.json.bak when it is corrupt) with the ledger's phase/paused_from,
+ *  or null when it cannot be read (deleted by `git clean -fdx`, corrupt without a usable backup). The guard enforces `phase` either way (inert only when phase is null, PAUSED or DONE).
+ *  A malformed ledger throws EwmError('parse_error') whose message names /ewm reset; the guard then denies with that message (fail closed). */
+export async function activeContext(ctx: Ctx): Promise<{ task: Task | null; profile: Profile; phase: Phase | null }>
+/** The active task id per the ledger, or null (throws on a malformed ledger). The guard names it when the task's files are missing. */
+export async function activeTaskId(ctx: Ctx): Promise<string | null>
 /** Records an agent spawn on the active task (no-op without one) and appends an audit line. */
 export async function recordAgentSpawn(ctx: Ctx, use: { agent_type: string; model: string; routed_model?: string; agent_id?: string; description?: string; rule: string }): Promise<void>
 /** Adds one turn's usage to usage_by_phase[task.phase] of the active task (no-op without one). */
@@ -375,14 +392,16 @@ Command semantics (`runCommand`):
 | Command | Behaviour |
 |---|---|
 | `new "title" [--goal g]` | ensureWorkspace; loadProfile (snapshot into the ledger); if another task is active and running, pause it first and say so; id = nextTaskId; repo = {root:'.', branch, base_commit} from `git rev-parse --abbrev-ref HEAD` / `git rev-parse HEAD` (null when git fails); create task in INTAKE with goal (default = title); save; set ledger active_task; render artifacts; audit `task_created`. Output: status text + `kickoff` asking the lead to load skill `ewm:intake` for TASK-NNN; `openPane: true`. |
-| `resume [id]` | id defaults to the ledger's active task, else the most recently updated non-DONE task. Load; reload profile into the ledger snapshot; staleness check (below); if PAUSED -> controller.resume(trusted task, at, profile) (phase and target from the ledger, clamped to PLAN without a valid plan approval); the reply lists, visibly, every profile field that differs from the previous snapshot; set active; save; render artifacts; audit `resume`. Output: renderResumeBrief + `context` [brief + "Do not repeat side-effecting operations; re-verify stale evidence before relying on it."] + `kickoff` to continue with the skill for the phase; `openPane: true`. |
+| `resume [id]` | id defaults to the ledger's active task, else the most recently updated non-DONE task. Load; reload profile into the ledger snapshot; staleness check (below); if PAUSED -> controller.resume(trusted task, at, profile) (phase and target from the ledger, clamped to PLAN without a valid plan approval); the reply lists, visibly, every profile field that differs from the previous snapshot; set active; save; render artifacts; audit `resume`. Output: renderResumeBrief + `context` [brief + "Do not repeat side-effecting operations; re-verify stale evidence before relying on it."] + `kickoff` to continue with the skill for the phase; `openPane: true`. F2: a task with NO ledger entry (after `/ewm reset`) is read from task.json: its entry is created with approvals and validations EMPTY (task.json's copies are not trusted), its phase capped at PLAN (IMPLEMENT/VALIDATE -> PLAN; PAUSED -> its `paused_from` capped the same way); a DONE task is refused. A transition `{actor:'system', reason:'ledger reset: gates must be approved again'}` is recorded (it replaces the wording of the PAUSED -> target transition `resume` records) and the reply and `context` say so. |
 | `status` | renderStatus of the active task (or "No active task" + list hint). `openPane: true`. |
 | `map` | renderSystemMap + the artifact path. |
 | `questions` | renderQuestions. |
 | `plan` | UNDERSTAND -> transition to PLAN as user + kickoff `ewm:plan` (the only way into PLAN from UNDERSTAND, CR10); EXPLORE/INTAKE -> explain the path; PLAN or later -> renderPlan. |
+| `reset` | F2, human origins only. The recovery path for a malformed ledger, or a fresh start: ensureWorkspace; `resetLedger` (backup of the raw ledger value to `<root>/.ewm/ledger-backup-<ISO time, ':' -> '-'>.json`, then an empty ledger: no active task). Task files are untouched. Output: where the backup is, which tasks are on disk, that gates must be approved again; `changed: true`. |
 | `pause` | controller.pause; save; render; audit `pause`. Keeps the active pointer. If the active task cannot be loaded, clears the pointer and says so. |
 | `approve [--plan <hash>] [note]` | pendingGate (trusted): plan_approval -> recordApproval + transition IMPLEMENT (actor user), kickoff `ewm:implement`; the reply echoes "(hash <8>, N steps, updated <plan.updated_at>)"; with `--plan` the command is refused when the plan hash does not start with the given prefix (the pane's Approve button always sends the full hash of the plan it drew, CR16); done_acceptance -> recordApproval + transition DONE + write handoff.md (changed files since base_commit, committed and uncommitted) + clear the active pointer. No pending gate -> explain what is missing. Audit `approval` + `transition`. |
 | `reject <note>` | records a rejected approval for the pending gate (stays in phase); kickoff asks the lead to revise. |
+| `status` (F1) | When the ledger names an active task whose files cannot be read, the reply says so, that the guard still enforces the ledger phase, and the two ways out: `/ewm list` (deactivates it) and `/ewm new` (start over). |
 | `list` | renderTaskList (clears a dangling active pointer). |
 | `help` / parse error | USAGE. |
 
@@ -415,10 +434,10 @@ export function engineIo(source: EngineIoSource): Io
 
 ## hooks/register.tsx (wiring)
 
-- `session.start`: pin `root` from `e.cwd` (absolute; keep it in `$.state` so a hot reload keeps it). Register `/ewm` (`argumentHint: '<new|resume|status|map|questions|plan|pause|approve|reject|list|help> [args]'`) and the model tools from `TOOL_SPECS` with `isDeferred` = no active running task (D8). If a task is active and running, set the status line and pane view. Never throw out of session.start.
-- `command.run {command:'ewm'}`: `new`, `resume`, `pause`, `plan`, `approve` and `reject` are accepted only when `e.origin.kind` is `composer`, `bridge` or `sdk` (D13, D19, CR6); otherwise refuse with a reason (`status`, `map`, `questions`, `list`, `help` work from any origin). Call `runCommand`; after a change refresh view, status line and tool deferral (re-register the tools with the new `isDeferred`; registering a name again replaces it); open the pane when `openPane` (fine when not placed: the text output is the fallback). Queue `kickoff` AFTER the command returns: `$.clock.after(0, () => void $.prompt.submit({ text: kickoff }))` (the host refuses `$.prompt.submit` inside a `command.run` hook). Return `{ text, context }`.
+- `session.start`: pin `root` from `e.cwd` (absolute; keep it in `$.state` so a hot reload keeps it). Register `/ewm` (`argumentHint: '<new|resume|status|map|questions|plan|pause|approve|reject|reset|list|help> [args]'`) and the model tools from `TOOL_SPECS` with `isDeferred` = no active running task (D8). If a task is active and running, set the status line and pane view. Never throw out of session.start.
+- `command.run {command:'ewm'}`: `new`, `resume`, `pause`, `plan`, `approve`, `reject` and `reset` are accepted only when `e.origin.kind` is `composer`, `bridge` or `sdk` (D13, D19, CR6); otherwise refuse with a reason (`status`, `map`, `questions`, `list`, `help` work from any origin). Call `runCommand`; strip a leading "ewm: " from every reply text (F4: the engine shows a command's output as "ewm: <text>"); after a change refresh view, status line and tool deferral (re-register the tools with the new `isDeferred`; registering a name again replaces it); open the pane when `openPane` (fine when not placed: the text output is the fallback). Queue `kickoff` AFTER the command returns: `$.clock.after(0, () => void $.prompt.submit({ text: kickoff }))` (the host refuses `$.prompt.submit` inside a `command.run` hook). Return `{ text, context }`.
 - `tool.call {tool:'mcp__ewm__<name>'}`: `runTool` -> `{ result: text, text }`, or the error as an error result; refresh view and status line after a change.
-- `tool.call` (all tools) guard: check the `mcp__ewm__` prefix and the read-only-agent rule without file access first where possible; otherwise `activeContext` + agent type from `$.agent.list()` by `e.agentId` + resolved write path (CR17: `$.fs.stat(path, { resolve: true }).realPath` of the nearest existing ancestor plus the remaining segments, `..` folded; unresolvable -> denied) -> `evaluateToolCall`; on deny return `{ deny: reason }` and `recordDenial`. Registered with the fail-closed `.catch(($, e, next) => next.called ? next(e) : { deny: 'ewm: policy guard failed; denied to stay safe' })`. Inert (no file reads beyond the ledger) without an active running task.
+- `tool.call` (all tools) guard: check the `mcp__ewm__` prefix and the read-only-agent rule without file access first where possible; otherwise `activeContext` + agent type from `$.agent.list()` by `e.agentId` + resolved write path (CR17: `$.fs.stat(path, { resolve: true }).realPath` of the nearest existing ancestor plus the remaining segments, `..` folded; unresolvable -> denied) -> `evaluateToolCall` with the LEDGER phase from `activeContext` (F1); on deny return `{ deny: reason }` and `recordDenial`; when the task's files are missing every deny reason ends with "TASK-NNN's files are missing: run /ewm status to see options (/ewm list deactivates it)"; a malformed ledger denies with the ledger error's own message (it names /ewm reset). Registered with the fail-closed `.catch(($, e, next) => next.called ? next(e) : { deny: 'ewm: policy guard failed; denied to stay safe' })`. Inert (no file reads beyond the ledger) without an active running task.
 - `agent.spawn`: for `ewm:*` types, `routeModel` (rewrite `e.model`) and, when `$.agent.list()` exposes running state, deny an (N+1)th concurrent ewm scout where N = `budgets.max_parallel_researchers`; `await next(e)`; then `recordAgentSpawn` with the resolved `model`, the `routed_model` and `agentId`. Refresh view.
 - `turn.complete`: `recordUsage` from the turn's usage when present.
 - Pane: `$.ui.open({ id: 'ewm', title: 'Engineering Workflow' })`; `ui.render {component:'Pane', requestId:'ewm'}` draws `PaneModel` from `$.state` (`ewm.view`, `ewm.section`, `ewm.notice`; `ewm.root` holds the pinned root across hot reloads): header, rail, counts, models, next action, and buttons `Map`, `Questions`, `Overview`, `Approve` (only with a pending gate; a press is a human origin). The pane also shows `Project: <profile_id>` and, while plan_approval is pending, `Plan <hash8> · N steps: <summary>`. Approve calls `runCommand(ctx, 'approve --plan <full hash of the plan drawn>', 'pane')`, so a plan replaced after the pane drew it is refused. Works on `terminal` and `desktop`.
@@ -437,7 +456,7 @@ These amend the sections above; where they conflict, this section wins.
 | # | Amendment |
 |---|---|
 | CR5 | The ledger entry holds `phase` and `paused_from` and is their source of truth. Every transition, pause and resume writes both ledger and task.json; the guard, gates, `activeContext` and `resume` use the ledger values (`trustedTask` overrides `phase`/`paused_from` too). A model edit of task.json while PAUSED or in IMPLEMENT cannot change the phase the mod enforces or where a task resumes. |
-| CR6 | State-changing commands (`new`, `resume`, `pause`, `plan`, `approve`, `reject`) are accepted only from human origins (`composer`, `bridge`, `sdk`, or a pane press). `status`, `map`, `questions`, `list`, `help` work from any origin. |
+| CR6 | State-changing commands (`new`, `resume`, `pause`, `plan`, `approve`, `reject`, `reset`) are accepted only from human origins (`composer`, `bridge`, `sdk`, or a pane press). `status`, `map`, `questions`, `list`, `help` work from any origin. |
 | CR7 | `nextTaskId` = max(task dirs, ledger task ids) + 1; creating a task replaces any stale ledger entry for its id. |
 | CR8 | `planHash` is SHA-256 (hex) over the canonical plan JSON, from a pure TypeScript implementation in `src/sha256.ts` tested against NIST vectors. |
 | CR9 | VALIDATE -> DONE needs >= 1 trusted validation with `ok: true` recorded after the latest transition into VALIDATE, plus the human acceptance. `pendingGate` follows the same rule. |
@@ -452,6 +471,19 @@ These amend the sections above; where they conflict, this section wins.
 | CR18 | Classifier: `tree -R` is not read_only; `git submodule foreach <cmd>` and `git -c alias.<x>=<v>` are classified on their payload (a `!` alias is a shell command); network programs and outbound tools gain the ones the security review found. |
 | CR19 | Redaction also covers the validation command, URL userinfo (`scheme://user:pass@`), `Authorization`/`Cookie` headers, `_authToken`, Slack `xox?-` tokens, JWTs and Google `AIza` keys. |
 
+## Final fixes (Run 3)
+
+The items below are the final review's F1-F6, cited in comments and tests as "F1"-"F6"; they are not the spec defects F1-F5 of SPEC-REVIEW.md.
+
+| # | Amendment |
+|---|---|
+| F1 | A deleted task folder (e.g. `git clean -fdx`) while the ledger names the task as active no longer bricks the session: `activeContext` returns the ledger `phase` even when `task` is null, the guard keeps enforcing it and appends "TASK-NNN's files are missing: run /ewm status to see options (/ewm list deactivates it)" to every deny, and `/ewm status` explains the two ways out. A malformed ledger still fails closed, with a message that names `/ewm reset`. |
+| F2 | `/ewm reset` (human origins only, CR6) backs up the raw ledger value and starts an empty one. A task without a ledger entry resumes with empty approvals and validations, capped at PLAN, with the transition reason "ledger reset: gates must be approved again"; a DONE task is not resumed. |
+| F3 | While a gate is pending (trusted), the next action shown in status, pane and resume brief is the review sentence of `render.nextActionOf`; the stored `next_action` is unchanged. |
+| F4 | The engine prints a command's output as "ewm: <text>", so the hooks module strips a leading "ewm: " from every command reply; errors wrapped inside other messages (`errorText`, store read errors, pause notes, audit lines) drop the inner prefix with `types.unprefixed`. |
+| F5 | `LedgerEntry.validating_since` is the only source of "entered VALIDATE at" (see Run 2 notes). |
+| F6 | The follow-up turn after a command is queued with `$.clock.after(0, ...)`, as before. No more reliable mechanism exists in the 2.1.296 declarations (`command.run` has no way to start a turn, `$.prompt.submit` is refused inside the hook, and a prompt is a turn "once the session is idle"). In headless `claude -p` runs it is best effort: send a follow-up prompt if none starts. |
+
 ### Run 2 implementation notes (state, persistence, presentation)
 
 Decisions taken while implementing CR3-CR17 and the review findings that fall in those modules. They extend the table above; nothing here overrides it.
@@ -459,6 +491,6 @@ Decisions taken while implementing CR3-CR17 and the review findings that fall in
 - **Approval is bound to what the person saw.** `/ewm approve --plan <hash>` (hex prefix, 8-64 digits) is refused when the current plan hash does not start with it. The pane's Approve button always passes the full hash of the plan it drew (`PaneModel.plan.hash`), so a plan replaced by the model between the draw and the click is refused. A bare `/ewm approve` still approves the current plan, and its reply echoes the hash prefix, the step count and the plan's `updated_at` (CR16).
 - **Evidence fingerprints.** `Evidence.fingerprint` (optional) is the `git hash-object` blob id of the cited file at record time. Staleness compares it with the file now, so a file that was already dirty is not stale at every resume. Directories, missing git and unknown files fall back to the changed-path rule (CR14).
 - **Ledger shape.** `LedgerEntry.phase` and `paused_from` are required; a ledger whose `active_task` has no entry is malformed (the active task's phase would otherwise be untrusted) and the guard fails closed. A resume of a task the ledger has never seen starts from `trustedTask(task, undefined)`: at most PLAN.
-- **Validation freshness (CR9)** is computed in the controller from `task.transitions` (the `at` of the latest transition into VALIDATE) and the ledger-backed `ok`/`at` of each run (`trustedTask` takes them from the ledger). A model that rewrites `transitions` in task.json could make an old pass look fresh; the person's acceptance remains the gate. Equal timestamps count as fresh.
+- **Validation freshness (CR9, F5)** is computed in the controller from `TrustedTask.validating_since` and the ledger-backed `ok`/`at` of each run. The service writes `LedgerEntry.validating_since` in `commitState` whenever a saved task's phase changes: the time of the change when it becomes VALIDATE (a transition, or a resume out of PAUSED), `null` when it leaves VALIDATE (to another phase, a pause, DONE). `trustedTask` hands it to the controller (and drops any `validating_since` key in task.json; `fromTrusted` keeps it out of task.json). `task.transitions` is no longer read, so rewriting it gains nothing. A ledger entry without the field (older ledger) yields no fresh validation (fail closed); the first `run_validation` the mod records in VALIDATE sets it, so the person can accept after re-running validation. Equal timestamps count as fresh.
 - **Profile changes are visible.** `/ewm resume` lists every profile field that differs from the ledger snapshot it replaces, in the reply the person reads (D14, D19).
 - **Model summaries (CR16)** group by the family the engine resolved, show the resolved id in brackets, and flag a resolved family that differs from the one the router asked for.

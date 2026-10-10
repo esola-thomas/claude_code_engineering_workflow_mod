@@ -14,6 +14,7 @@ import { DEFAULT_PROFILE } from '../src/profile.ts'
 import { AGENT_ROLES, routeModel } from '../src/router.ts'
 import {
   activeContext,
+  activeTaskId,
   currentView,
   recordAgentSpawn,
   recordDenial,
@@ -25,6 +26,7 @@ import {
 } from '../src/service.ts'
 import type { Ctx } from '../src/service.ts'
 import { joinPath } from '../src/store.ts'
+import { EwmError, unprefixed } from '../src/types.ts'
 import type { CommandOutput } from '../src/types.ts'
 
 type View = PluginState['ewm']['view']
@@ -37,13 +39,13 @@ const ROOT = { plugin: 'ewm', key: 'root' } as const
 
 const PANE_ID = 'ewm'
 const PANE_TITLE = 'Engineering Workflow'
-const COMMAND_HINT = '<new|resume|status|map|questions|plan|pause|approve|reject|list|help> [args]'
+const COMMAND_HINT = '<new|resume|status|map|questions|plan|pause|approve|reject|reset|list|help> [args]'
 
 /** D13, D19: only a person (or the script that drives a headless run) may change workflow state. */
 const HUMAN_ORIGINS: readonly string[] = ['composer', 'bridge', 'sdk']
 
 /** CR6: the /ewm commands that change state. status, map, questions, list and help are read-only and work from any origin. */
-const STATE_CHANGING_COMMANDS: readonly string[] = ['new', 'resume', 'pause', 'plan', 'approve', 'reject']
+const STATE_CHANGING_COMMANDS: readonly string[] = ['new', 'resume', 'pause', 'plan', 'approve', 'reject', 'reset']
 
 const GATE_LABELS: Record<string, string> = { plan_approval: 'plan approval', done_acceptance: 'done acceptance' }
 
@@ -157,12 +159,27 @@ async function resolveWritePath($: EngineInterface, root: string, input: Record<
   }
 }
 
+/** Appended to every deny reason while the ledger names an active task whose files are gone (F1): the policy still applies, and this says how to get out. */
+async function missingFilesNote(ctx: Ctx): Promise<string> {
+  const id = await activeTaskId(ctx).catch(() => null)
+  return `${id ?? 'The active task'}'s files are missing: run /ewm status to see options (/ewm list deactivates it)`
+}
+
 /** The deny reason for a tool call, or null to let it through. Throws when the guard cannot decide (the caller fails closed). */
 async function judgeToolCall($: EngineInterface, e: { tool: string; agentId?: string | undefined }): Promise<string | null> {
   const ctx = await ctxOf($)
   if (ctx === null) return null
-  const { task, profile } = await activeContext(ctx)
-  if (task === null || task.phase === 'PAUSED' || task.phase === 'DONE') return null
+  let context: Awaited<ReturnType<typeof activeContext>>
+  try {
+    context = await activeContext(ctx)
+  } catch (error) {
+    // A malformed ledger: nothing can be decided, so everything is denied, but with the way out (/ewm reset) instead of a bare "guard failed".
+    if (error instanceof EwmError) return error.message
+    throw error
+  }
+  // The LEDGER's phase decides (F1): task.json may be missing, and is never the authority anyway.
+  const { task, profile, phase } = context
+  if (phase === null || phase === 'PAUSED' || phase === 'DONE') return null
 
   const input = e as unknown as Record<string, unknown>
   const call: PolicyCall = { tool: e.tool, input }
@@ -171,14 +188,23 @@ async function judgeToolCall($: EngineInterface, e: { tool: string; agentId?: st
     if (resolvedPath !== undefined) call.resolvedPath = resolvedPath
   }
   const agentType = await agentTypeOf($, e.agentId)
-  const verdict = evaluateToolCall({ phase: task.phase, profile, root: ctx.root, agentType }, call)
+  const verdict = evaluateToolCall({ phase, profile, root: ctx.root, agentType }, call)
   if (verdict.allow) return null
-  await safely(() => recordDenial(ctx, e.tool, verdict.reason))
-  return verdict.reason
+  const reason = task === null ? `${verdict.reason} ${await missingFilesNote(ctx)}` : verdict.reason
+  await safely(() => recordDenial(ctx, e.tool, reason))
+  return reason
 }
 
 function refusedCommand(command: string): string {
   return `ewm: /ewm ${command} is refused from this origin. Only a person decides gates and changes the workflow state: ask them to type /ewm ${command} in their prompt.`
+}
+
+/**
+ * The text of a command reply. The engine shows a command's output under the plugin's name ("ewm: <text>"), so a message that starts
+ * with "ewm: " itself would read "ewm: ewm: ..." (F4). The prefix is dropped here, once, for every reply this module returns.
+ */
+function replyText(text: string): string {
+  return unprefixed(text)
 }
 
 /** Finishes a command: refresh the views, open the pane, queue the kickoff and shape the reply. */
@@ -187,7 +213,8 @@ async function settle($: EngineInterface, ctx: Ctx, out: CommandOutput): Promise
   await safely(() => $.state.set(NOTICE, null))
   if (out.openPane === true) await openPane($)
   queueKickoff($, out.kickoff)
-  return out.context === undefined ? { text: out.text } : { text: out.text, context: out.context }
+  const text = replyText(out.text)
+  return out.context === undefined ? { text } : { text, context: out.context }
 }
 
 /** The Approve button: same use case as /ewm approve, recorded as `via: 'pane'`. It carries the hash of the plan that was drawn, so a plan replaced since is refused. */
@@ -218,13 +245,13 @@ export const register: Register = on => {
 
   on('command.run', { command: 'ewm' }, async ($, e) => {
     const ctx = await ctxOf($)
-    if (ctx === null) return { text: 'ewm: the workspace root is not known yet. Start a new session in the project folder and try again.' }
+    if (ctx === null) return { text: replyText('ewm: the workspace root is not known yet. Start a new session in the project folder and try again.') }
     const parsed = parseCommand(e.args)
     if ('name' in parsed && STATE_CHANGING_COMMANDS.includes(parsed.name) && !HUMAN_ORIGINS.includes(e.origin.kind)) {
-      return { text: refusedCommand(parsed.name) }
+      return { text: replyText(refusedCommand(parsed.name)) }
     }
     return settle($, ctx, await runCommand(ctx, e.args, 'command'))
-  }).catch(() => ({ text: 'ewm: the command failed unexpectedly. Run /ewm status to see where the task stands.' }))
+  }).catch(() => ({ text: replyText('ewm: the command failed unexpectedly. Run /ewm status to see where the task stands.') }))
 
   // Guard first: hooks registered earlier sit outside later ones, so a denial never reaches the tools below.
   on('tool.call', async ($, e, next) => {
@@ -249,7 +276,7 @@ export const register: Register = on => {
     const active = ctx === null ? null : await activeContext(ctx).catch(() => null)
     const profile = active?.profile ?? DEFAULT_PROFILE
 
-    if (active?.task != null && AGENT_ROLES[e.subagentType] === 'search') {
+    if (active?.phase != null && AGENT_ROLES[e.subagentType] === 'search') {
       const limit = profile.budgets.max_parallel_researchers
       const agents = await $.agent.list()
       const busy = agents.filter(a => AGENT_ROLES[a.type] === 'search' && (a.status === 'running' || a.status === 'pending')).length

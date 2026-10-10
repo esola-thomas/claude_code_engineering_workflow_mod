@@ -11,6 +11,7 @@ export type EwmCommand =
   | { name: 'questions' }
   | { name: 'plan' }
   | { name: 'pause' }
+  | { name: 'reset' } // /ewm reset: back up the gate ledger and start an empty one (recovery from a malformed ledger, or a fresh start)
   | { name: 'list' }
   | { name: 'help' }
   | { name: 'approve'; note?: string; plan?: string } // /ewm approve [--plan <hash>] [note...]
@@ -24,6 +25,7 @@ export const USAGE = [
   '/ewm questions                         show open and resolved questions',
   '/ewm plan                              move to PLAN once understood, or show the plan',
   '/ewm pause                             save a checkpoint and leave the workflow',
+  '/ewm reset                             back up the gate ledger and start an empty one (fixes a malformed ledger; gates must be approved again)',
   '/ewm approve [--plan <hash>] [note]    approve the pending gate (plan or final acceptance); --plan refuses if the plan is not the one with that hash',
   '/ewm reject <reason>                   send the pending gate back with a reason',
   '/ewm list                              list tasks',
@@ -188,7 +190,7 @@ function parseResume(rest: string): ParseResult {
   return { name: 'resume', id }
 }
 
-const NO_ARGUMENT_COMMANDS = ['status', 'map', 'questions', 'plan', 'pause', 'list', 'help'] as const
+const NO_ARGUMENT_COMMANDS = ['status', 'map', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const
 type NoArgumentName = (typeof NO_ARGUMENT_COMMANDS)[number]
 
 function isNoArgumentCommand(name: string): name is NoArgumentName {

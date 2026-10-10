@@ -39,6 +39,7 @@ import {
   loadTaskRecovering,
   nextTaskId,
   redactSecrets,
+  resetLedger,
   saveLedger,
   saveTask,
   taskDir,
@@ -46,7 +47,7 @@ import {
   updateLedgerEntry,
   writeArtifact,
 } from './store.ts'
-import { ARTIFACT_NAMES, EwmError, PHASES } from './types.ts'
+import { ARTIFACT_NAMES, EWM_PREFIX, EwmError, PHASES, unprefixed } from './types.ts'
 import type {
   ArtifactName,
   AuditEntry,
@@ -57,6 +58,7 @@ import type {
   GateName,
   Io,
   Ledger,
+  LedgerEntry,
   PaneModel,
   Phase,
   PhaseUsage,
@@ -68,6 +70,7 @@ import type {
   Staleness,
   Task,
   ToolOutput,
+  TrustedTask,
   ValidationRun,
 } from './types.ts'
 
@@ -99,13 +102,19 @@ function withLock<T>(job: () => Promise<T>): Promise<T> {
 // Small helpers
 // ---------------------------------------------------------------------------
 
+/** The message for the person or model, with the "ewm: " prefix exactly once (F4), whatever the error already carried. */
 function errorText(error: unknown): string {
-  if (error instanceof EwmError) return error.message
-  return `ewm: unexpected error: ${error instanceof Error ? error.message : String(error)}`
+  if (error instanceof EwmError) return `${EWM_PREFIX}${unprefixed(error.message)}`
+  return `${EWM_PREFIX}unexpected error: ${unprefixed(error instanceof Error ? error.message : String(error))}`
+}
+
+/** The same message to embed inside another one: no prefix of its own. */
+function reasonText(error: unknown): string {
+  return unprefixed(errorText(error))
 }
 
 function invalid(message: string): EwmError {
-  return new EwmError('invalid_input', `ewm: ${message}`)
+  return new EwmError('invalid_input', `${EWM_PREFIX}${unprefixed(message)}`)
 }
 
 async function nowIso(io: Io): Promise<string> {
@@ -333,7 +342,7 @@ async function requireRunning(ctx: Ctx, audience: Audience = 'model'): Promise<A
 }
 
 /** What the controller sees: phase, approvals and validations from the ledger only. */
-function trustedOf(task: Task, ledger: Ledger): Task {
+function trustedOf(task: Task, ledger: Ledger): TrustedTask {
   return trustedTask(task, ledger.tasks[task.id])
 }
 
@@ -357,7 +366,9 @@ function statusOf(task: Task, ledger: Ledger, profile: Profile): string {
 
 /** Carries a controller result computed on the trusted task back onto the real one: task.json keeps its own approvals and validations. */
 function fromTrusted(original: Task, computed: Task): Task {
-  return { ...computed, approvals: original.approvals, validations: original.validations }
+  // validating_since lives in the ledger only (F5); it must not leak into task.json, where the model could edit it.
+  const { validating_since: _ledgerOnly, ...rest } = computed as TrustedTask
+  return { ...rest, approvals: original.approvals, validations: original.validations }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +427,10 @@ async function commitState(ctx: Ctx, view: { ledger: Ledger; profile: Profile; r
   const entry = ledger.tasks[saved.id]
   let ledgerChanged = options.ledger !== undefined
   if (entry !== undefined && (entry.phase !== saved.phase || entry.paused_from !== saved.paused_from)) {
-    ledger = { ...ledger, tasks: { ...ledger.tasks, [saved.id]: { ...entry, phase: saved.phase, paused_from: saved.paused_from } } }
+    const synced: LedgerEntry = { ...entry, phase: saved.phase, paused_from: saved.paused_from }
+    // F5: the ledger, not task.json, remembers when the task entered VALIDATE; leaving it clears the mark.
+    if (entry.phase !== saved.phase) synced.validating_since = saved.phase === 'VALIDATE' ? options.at : null
+    ledger = { ...ledger, tasks: { ...ledger.tasks, [saved.id]: synced } }
     ledgerChanged = true
   }
   if (ledgerChanged) await saveLedger(io, root, ledger)
@@ -432,7 +446,7 @@ async function commitState(ctx: Ctx, view: { ledger: Ledger; profile: Profile; r
       await writeArtifact(io, root, saved.id, name, renderArtifact(name, saved, gate, options.changedFiles ?? []))
     }
   } catch (error) {
-    drafts.push({ kind: 'error', detail: `an artifact could not be written (${errorText(error)}); it is re-rendered on the next transition or resume` })
+    drafts.push({ kind: 'error', detail: `an artifact could not be written (${reasonText(error)}); it is re-rendered on the next transition or resume` })
   }
   for (const draft of drafts) {
     const item: AuditEntry = { at: options.at, kind: draft.kind, phase: saved.phase, detail: draft.detail }
@@ -501,7 +515,7 @@ async function pauseOther(ctx: Ctx, ledger: Ledger, keepId: string | null, at: s
     })
     return { note: `Paused ${otherId} (was in ${other.phase}); resume it later with /ewm resume ${otherId}.`, ledger: saved.ledger }
   } catch (error) {
-    return { note: `Could not pause ${otherId} (${errorText(error)}); it was left untouched.`, ledger }
+    return { note: `Could not pause ${otherId} (${reasonText(error)}); it was left untouched.`, ledger }
   }
 }
 
@@ -616,6 +630,25 @@ async function defaultResumeId(ctx: Ctx, ledger: Ledger): Promise<string> {
   return latest.id
 }
 
+const LEDGER_RESET_REASON = 'ledger reset: gates must be approved again'
+
+/** F2: the task had no ledger entry (the ledger was reset, or never saw it). Its entry starts with no approvals and no validation runs, and its phase is capped at PLAN. */
+function resumeWithoutLedger(raw: Task, resumed: Task, at: string): Task {
+  const target = raw.phase === 'PAUSED' ? raw.paused_from : raw.phase
+  const capped = target !== resumed.phase
+  const record = { from: raw.phase, to: resumed.phase, actor: 'system' as const, reason: LEDGER_RESET_REASON, at }
+  // A resume out of PAUSED already recorded its own transition; the reset reason replaces its wording instead of adding a second line.
+  const added = resumed.transitions.length > raw.transitions.length
+  const transitions = added ? [...resumed.transitions.slice(0, -1), { ...record, from: 'PAUSED' as const }] : [...resumed.transitions, record]
+  return { ...resumed, transitions, next_action: capped ? defaultNextAction(resumed.phase) : resumed.next_action, updated_at: at }
+}
+
+function ledgerResetNotice(raw: Task, resumed: Task): string {
+  const from = raw.phase === 'PAUSED' ? raw.paused_from ?? 'INTAKE' : raw.phase
+  const cap = from === resumed.phase ? `Phase ${resumed.phase}` : `Phase ${resumed.phase} (it was ${from}; resuming without a ledger caps it at PLAN)`
+  return `Ledger reset: ${raw.id} had no entry in the gate ledger, so it resumes with no recorded approvals or validation runs. ${cap}. Gates must be approved again.`
+}
+
 async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume' }>): Promise<CommandOutput> {
   const { io, root } = ctx
   const loadedLedger = await loadLedger(io, root)
@@ -624,7 +657,8 @@ async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume'
   // CR5: phase, resume target, approvals and validations come from the ledger; task.json is only a mirror.
   const known = loadedLedger.tasks[id]
   const trusted = trustedTask(raw, known)
-  if (trusted.phase === 'DONE') {
+  // F2: a task with no ledger entry (after /ewm reset) is read from task.json, whose phase trustedTask caps at PLAN; DONE must still be refused.
+  if ((known === undefined ? raw.phase : trusted.phase) === 'DONE') {
     throw invalid(`${id} is DONE, so there is nothing to resume. Its handoff is in ${EWM_DIR}/tasks/${id}/handoff.md; start a new task with /ewm new.`)
   }
   const { profile, source, warnings } = await loadProfile(io, root)
@@ -632,7 +666,7 @@ async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume'
   const { note: pausedNote, ledger } = await pauseOther(ctx, loadedLedger, id, at)
 
   const { staleness, task: checked } = await checkStaleness(ctx, trusted)
-  const resumed = { ...resume(checked, at, profile), updated_at: at }
+  const resumed = known === undefined ? resumeWithoutLedger(raw, resume(checked, at, profile), at) : { ...resume(checked, at, profile), updated_at: at }
   // Humans reload the profile here; the guard and tools use this snapshot until the next resume.
   const withEntry = updateLedgerEntry(
     ledger,
@@ -653,20 +687,62 @@ async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume'
     changes.length === 0
       ? []
       : ['', 'The project profile changed since the last snapshot and applies from now on:', ...changes.map(change => `  - ${change}`), 'If you did not edit .ewm/project.yaml yourself, check it before continuing.']
-  const text = [brief, ...(pausedNote === null ? [] : ['', pausedNote]), ...profileNotice, ...warningLines([...warnings, ...validationWarnings(profile)])].join('\n')
+  const resetNotice = known === undefined ? [ledgerResetNotice(raw, saved.task)] : []
+  const text = [brief, ...resetNotice.flatMap(line => ['', line]), ...(pausedNote === null ? [] : ['', pausedNote]), ...profileNotice, ...warningLines([...warnings, ...validationWarnings(profile)])].join('\n')
   return {
     text,
-    context: [brief, 'Do not repeat side-effecting operations; re-verify stale evidence before relying on it.'],
+    context: [brief, ...resetNotice, 'Do not repeat side-effecting operations; re-verify stale evidence before relying on it.'],
     kickoff: `Continue ${id} in ${saved.task.phase}: load the skill ${skillFor(saved.task.phase)} and pick up from the resume brief.`,
     changed: true,
     openPane: true,
   }
 }
 
+/** What /ewm status says when the ledger names an active task whose files cannot be read (F1): why, what still applies, and the two ways out. */
+function missingFilesText(id: string, entry: LedgerEntry | undefined, error: unknown): string {
+  const phase = entry === undefined ? 'its' : entry.phase
+  return [
+    `${id}'s files are missing or unreadable, but the gate ledger still lists it as the active task (${reasonText(error)})`,
+    `Until you act, the policy guard keeps enforcing the ${phase} rules, so tool calls may be denied.`,
+    'Two ways out:',
+    `  - /ewm list: deactivates ${id} (its ledger entry is kept, so restoring the folder .ewm/tasks/${id}/ and running /ewm resume ${id} brings it back) and shows the tasks that are left.`,
+    '  - /ewm new "<title>": starts a new task (the missing one is left as it is).',
+  ].join('\n')
+}
+
 async function cmdStatus(ctx: Ctx): Promise<CommandOutput> {
-  const active = await loadActive(ctx)
-  if (active === null) return { ...noActiveOutput(), openPane: true }
-  return { text: statusOf(active.task, active.ledger, active.profile), changed: false, openPane: true }
+  const ledger = await loadLedger(ctx.io, ctx.root)
+  const id = ledger.active_task
+  if (id === null) return { ...noActiveOutput(), openPane: true }
+  let task: Task
+  try {
+    task = (await loadTaskRecovering(ctx.io, ctx.root, id)).task
+  } catch (error) {
+    return { text: missingFilesText(id, ledger.tasks[id], error), changed: false, openPane: true }
+  }
+  const profile = profileOf(ledger, id)
+  return { text: statusOf(withLedgerPhase(task, ledger), ledger, profile), changed: false, openPane: true }
+}
+
+/** F2: the recovery path for a malformed ledger, or a fresh start. Backs up the raw ledger value, stores an empty ledger, leaves every task on disk alone. */
+async function cmdReset(ctx: Ctx): Promise<CommandOutput> {
+  const { io, root } = ctx
+  await ensureWorkspace(io, root)
+  const at = await nowIso(io)
+  const { backup } = await resetLedger(io, root, at)
+  const tasks = await listTasks(io, root)
+  const left = tasks.length === 0 ? 'There are no tasks on disk.' : `Tasks on disk (untouched): ${tasks.map(task => task.id).join(', ')}.`
+  return {
+    text: [
+      'The gate ledger was reset: no task is active now.',
+      `The previous ledger value was saved to ${backup}.`,
+      left,
+      'Approvals and validation runs recorded in the old ledger no longer count: a task you resume starts at PLAN at most and its gates must be approved again.',
+      'Continue with /ewm resume TASK-NNN, or start over with /ewm new "<title>".',
+    ].join('\n'),
+    changed: true,
+    openPane: true,
+  }
 }
 
 async function cmdMap(ctx: Ctx): Promise<CommandOutput> {
@@ -881,6 +957,8 @@ async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via): Promise
       return cmdPlan(ctx)
     case 'pause':
       return cmdPause(ctx)
+    case 'reset':
+      return cmdReset(ctx)
     case 'approve':
       return cmdDecide(ctx, via, 'approved', command.note, command.plan)
     case 'reject':
@@ -1294,7 +1372,7 @@ async function executeValidation(ctx: Ctx, prepared: PreparedRun): Promise<{ exi
     output = result.stderr === '' ? result.stdout : `${result.stdout}${result.stdout.endsWith('\n') || result.stdout === '' ? '' : '\n'}${result.stderr}`
   } catch (error) {
     exitCode = -1
-    output = `ewm: could not run the command (not started, or it timed out after ${prepared.timeoutMs} ms): ${error instanceof Error ? error.message : String(error)}`
+    output = `ewm: could not run the command (not started, or it timed out after ${prepared.timeoutMs} ms): ${unprefixed(error instanceof Error ? error.message : String(error))}`
   }
   const finished = await ctx.io.now()
   return { exitCode, output, durationMs: Math.max(0, finished - started) }
@@ -1327,7 +1405,12 @@ async function recordValidation(ctx: Ctx, prepared: PreparedRun, result: { exitC
   const nextLedger = updateLedgerEntry(
     ledger,
     task.id,
-    entry => ({ ...entry, validations: [...entry.validations, { id: run.id, command: run.command, exit_code: run.exit_code, ok: run.ok, at }] }),
+    // An older ledger entry has no validating_since (F5): the first run the mod records in VALIDATE sets it, so the person can accept after re-running validation.
+    entry => ({
+      ...entry,
+      validating_since: typeof entry.validating_since === 'string' ? entry.validating_since : at,
+      validations: [...entry.validations, { id: run.id, command: run.command, exit_code: run.exit_code, ok: run.ok, at }],
+    }),
     { profile, profile_source: null },
   )
   const saved = await persist(ctx, { ledger: nextLedger, profile }, { ...task, validations: [...task.validations, run], updated_at: at }, {
@@ -1589,11 +1672,27 @@ export async function runTool(ctx: Ctx, name: string, input: Record<string, unkn
 // For the hooks module
 // ---------------------------------------------------------------------------
 
-/** For the policy guard. Reads the ledger first; returns { task: null, profile: DEFAULT_PROFILE } when no task is active WITHOUT touching any other file.
- *  With an active task: loads task.json and returns the ledger's profile snapshot. A malformed ledger or unreadable active task throws (the guard fails closed). */
-export async function activeContext(ctx: Ctx): Promise<{ task: Task | null; profile: Profile }> {
-  const active = await loadActive(ctx)
-  return active === null ? { task: null, profile: DEFAULT_PROFILE } : { task: active.task, profile: active.profile }
+/** For the policy guard. Reads the ledger first; returns { task: null, profile: DEFAULT_PROFILE, phase: null } when no task is active WITHOUT touching any other file.
+ *  With an active task, `phase` is the LEDGER's phase and `profile` the ledger's snapshot (F1). `task` is task.json (or its backup) with the ledger's phase, or null when neither can be
+ *  read: the guard then still enforces `phase`, so a deleted task folder (git clean -fdx) cannot switch the policy off or deny every call until someone notices.
+ *  A malformed ledger throws (the guard fails closed; the message names /ewm reset). */
+export async function activeContext(ctx: Ctx): Promise<{ task: Task | null; profile: Profile; phase: Phase | null }> {
+  const ledger = await loadLedger(ctx.io, ctx.root)
+  const id = ledger.active_task
+  if (id === null) return { task: null, profile: DEFAULT_PROFILE, phase: null }
+  const entry = ledger.tasks[id]
+  if (entry === undefined) throw new EwmError('parse_error', `ewm: the gate ledger names ${id} as active but has no entry for it. Ask the person to run /ewm reset.`)
+  try {
+    const { task } = await loadTaskRecovering(ctx.io, ctx.root, id)
+    return { task: withLedgerPhase(task, ledger), profile: entry.profile, phase: entry.phase }
+  } catch {
+    return { task: null, profile: entry.profile, phase: entry.phase }
+  }
+}
+
+/** The id of the active task per the ledger, or null (throws on a malformed ledger). The guard names it when the task's files are missing. */
+export async function activeTaskId(ctx: Ctx): Promise<string | null> {
+  return (await loadLedger(ctx.io, ctx.root)).active_task
 }
 
 /** The active task when it is running (neither PAUSED nor DONE), else null. */

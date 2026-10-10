@@ -91,7 +91,7 @@ describe('parseCommand: simple commands', () => {
     assert.deepEqual(parseCommand('   \n '), { name: 'status' })
   })
 
-  for (const name of ['status', 'map', 'questions', 'plan', 'pause', 'list', 'help'] as const) {
+  for (const name of ['status', 'map', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const) {
     it(`parses ${name}`, () => {
       assert.deepEqual(parseCommand(name), { name })
       assert.deepEqual(parseCommand(`  ${name}  `), { name })
@@ -237,12 +237,12 @@ describe('USAGE', () => {
   const lines = USAGE.split('\n')
 
   it('has one line per command', () => {
-    assert.equal(lines.length, 11)
+    assert.equal(lines.length, 12)
     for (const line of lines) assert.ok(line.startsWith('/ewm '), line)
   })
 
   it('mentions every command exactly once', () => {
-    for (const name of ['new', 'resume', 'status', 'map', 'questions', 'plan', 'pause', 'approve', 'reject', 'list', 'help']) {
+    for (const name of ['new', 'resume', 'status', 'map', 'questions', 'plan', 'pause', 'reset', 'approve', 'reject', 'list', 'help']) {
       assert.equal(lines.filter(line => line.startsWith(`/ewm ${name}`)).length, 1, name)
     }
   })

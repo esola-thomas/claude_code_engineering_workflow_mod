@@ -36,6 +36,7 @@ To stop at any point, run `/ewm pause`. In a new session, `/ewm resume TASK-001`
 | `/ewm questions` | Show open and resolved questions. | Any |
 | `/ewm plan` | In UNDERSTAND, move to PLAN. In PLAN or later, show the plan. In INTAKE or EXPLORE, explain the path to PLAN. | You |
 | `/ewm pause` | Save a checkpoint and leave the workflow. | You |
+| `/ewm reset` | Save the gate ledger to `.ewm/ledger-backup-<time>.json` and start an empty one. Use it when the ledger is reported malformed, or to start over. Tasks on disk are kept; a task you resume afterwards starts at PLAN at most, with no approvals, so you approve its gates again. | You |
 | `/ewm approve [--plan <hash>] [note]` | Approve the pending gate: in PLAN this moves to IMPLEMENT, in VALIDATE it moves to DONE. `--plan` refuses unless the plan still starts with that hash. | You |
 | `/ewm reject <reason>` | Send the pending gate back with a reason. The task stays in its phase. | You |
 | `/ewm list` | List tasks. | Any |
@@ -78,7 +79,7 @@ stateDiagram-v2
 - **advance (model)** edges are taken by the lead through `mcp__ewm__advance`. Only the edge from UNDERSTAND to PLAN is reserved for you.
 - **Gate 1, plan approval (PLAN to IMPLEMENT).** Needs a plan with at least one step and your `/ewm approve`. The approval records the plan's hash. Editing the plan afterwards voids the approval, so you approve again. The gate is skipped when `policies.require_plan_approval` is `false`.
 - **Gate 2, acceptance (VALIDATE to DONE).** Needs your `/ewm approve` and at least one passing `run_validation` run recorded since the task entered VALIDATE. Closing writes `handoff.md` and clears the active task.
-- **Pause and resume.** `/ewm pause` works from any active phase. `/ewm resume` returns the task to the phase it was paused from. If that phase is IMPLEMENT or VALIDATE and the plan has no valid approval, the task resumes in PLAN.
+- **Pause and resume.** `/ewm pause` works from any active phase. `/ewm resume` returns the task to the phase it was paused from. If that phase is IMPLEMENT or VALIDATE and the plan has no valid approval, the task resumes in PLAN. After `/ewm reset`, a task the ledger no longer knows resumes at PLAN at most with no approvals; a DONE task is not resumed.
 - **Pane and status line.** The Engineering Workflow pane shows the phase, counts, models, next action and the buttons Overview, Map, Questions and Approve. Approve appears only while a gate waits for you. The status line shows the task, the phase and any pending gate. If the pane is not placed, the text output of each command is the fallback.
 
 ## Configuration
@@ -167,7 +168,17 @@ What it does not protect against is listed under "Known limits" in [docs/SPEC-RE
     └── handoff.md        written when the task reaches DONE
 ```
 
+`/ewm reset` also writes `.ewm/ledger-backup-<time>.json` (the ledger it replaced). It is not in `tasks/`, so `.ewm/.gitignore` does not ignore it.
+
 Task files are gitignored by default. Delete `.ewm/.gitignore` if you want to commit them. The mod's gate ledger is outside `.ewm/`, in Claude Code's plugin store.
+
+## Known limits
+
+- If a task folder is deleted (for example by `git clean -fdx`) while the ledger still lists the task as active, the guard keeps enforcing that task's phase and each denial says so. `/ewm status` explains the situation; `/ewm list` deactivates the task, and `/ewm new` starts over.
+- A malformed or stale gate ledger blocks everything until you run `/ewm reset`. It backs the ledger up first, but approvals recorded in it no longer count.
+- In headless `claude -p` runs the follow-up turn after a command is best effort; send a follow-up prompt if none starts.
+
+The full list is under "Known limits" in [docs/SPEC-REVIEW.md](docs/SPEC-REVIEW.md#known-limits-accepted-for-v000).
 
 ## Compatibility
 
@@ -194,7 +205,7 @@ CI (`.github/workflows/ci.yml`) runs the unit tests, validation and engine tests
 
 For a development session, run `claude --plugin-dir .` from the repository root. It loads the working copy of the mod.
 
-Design documents: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (module contracts), [docs/SPEC-REVIEW.md](docs/SPEC-REVIEW.md) (decisions D1-D20 and fixes F1-F5), [docs/WORKFLOW.md](docs/WORKFLOW.md) (how v0.0.0 was built and its metrics).
+Design documents: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (module contracts), [docs/SPEC-REVIEW.md](docs/SPEC-REVIEW.md) (decisions D1-D22 and fixes F1-F5), [docs/WORKFLOW.md](docs/WORKFLOW.md) (how v0.0.0 was built and its metrics).
 
 ## Status
 

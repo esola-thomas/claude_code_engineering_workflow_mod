@@ -53,7 +53,9 @@ test('/ewm status, list and help answer from the active task', async ($, on) => 
   expect(help.text).toContain('/ewm approve')
 
   const unknown = await h.ewm('frobnicate')
-  expect(unknown.text).toContain('ewm:')
+  // F4: the engine shows a command's output as "ewm: <text>", so the text itself carries no prefix (it would read "ewm: ewm: ...").
+  expect(unknown.text).toContain('unknown command')
+  expect(unknown.text).not.toMatch(/^ewm: /)
   expect(unknown.text).toContain('/ewm new')
 })
 
@@ -91,7 +93,8 @@ test('/ewm approve without a pending gate explains what is missing', async ($, o
   await h.start()
   await h.ewm('new "Fix sum"')
   const out = await h.ewm('approve')
-  expect(out.text).toContain('ewm:')
+  expect(out.text).toContain('nothing to approve in INTAKE')
+  expect(out.text).not.toMatch(/^ewm: /)
   expect(h.task().phase).toBe('INTAKE')
   expect(TASK_DIR).toContain('TASK-001')
 })

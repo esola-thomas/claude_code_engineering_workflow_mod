@@ -7,7 +7,7 @@
 
 import { sha256Hex } from './sha256.ts'
 import { ACTIVE_PHASES, EwmError } from './types.ts'
-import type { ActivePhase, Actor, Approval, GateName, Phase, Plan, Profile, Task, ValidationRun } from './types.ts'
+import type { ActivePhase, Actor, Approval, GateName, Phase, Plan, Profile, Task, TrustedTask, ValidationRun } from './types.ts'
 
 function edgesTo(...phases: Phase[]): readonly Phase[] {
   return Object.freeze(phases)
@@ -82,26 +82,20 @@ function hasPlanSteps(task: Task): boolean {
   return task.plan !== null && task.plan.steps.length >= 1
 }
 
-/** When the task last entered VALIDATE, or null when it never did (the first entry is in task.transitions). */
-function lastEnteredValidate(task: Task): string | null {
-  for (let i = task.transitions.length - 1; i >= 0; i--) {
-    const item = task.transitions[i]
-    if (item !== undefined && item.to === 'VALIDATE') return item.at
-  }
-  return null
-}
-
-/** CR9: the runs that can back an acceptance: passing (ok) and recorded since the latest entry into VALIDATE.
+/** CR9, F5: the runs that can back an acceptance: passing (ok) and recorded since the latest entry into VALIDATE.
+ *  That moment is `task.validating_since`, which `store.trustedTask` takes from the LEDGER; `task.transitions` (task.json, which the model can
+ *  rewrite) is never consulted. Without it (an older ledger, or a plain task) nothing is fresh and the person re-runs validation.
  *  A failing run, or a pass from before the code was changed again, does not count. The caller passes the trusted task. */
-export function freshValidations(task: Task): ValidationRun[] {
-  const since = lastEnteredValidate(task)
-  return task.validations.filter(run => run.ok && (since === null || run.at >= since))
+export function freshValidations(task: TrustedTask): ValidationRun[] {
+  const since = task.validating_since
+  if (typeof since !== 'string') return []
+  return task.validations.filter(run => run.ok && run.at >= since)
 }
 
 /** The gate a human could act on now, else null:
  *  PLAN with plan (>=1 step), require_plan_approval, no valid approval -> 'plan_approval';
  *  VALIDATE with >= 1 passing validation recorded since entering VALIDATE (CR9) and no valid acceptance -> 'done_acceptance'. */
-export function pendingGate(task: Task, profile: Profile): GateName | null {
+export function pendingGate(task: TrustedTask, profile: Profile): GateName | null {
   if (
     task.phase === 'PLAN' &&
     hasPlanSteps(task) &&
@@ -119,7 +113,7 @@ export function pendingGate(task: Task, profile: Profile): GateName | null {
 const STALE_VALIDATION =
   'no passing validation run is recorded since the task entered VALIDATE (the last run failed, or the code changed after the last pass; fix it in IMPLEMENT if needed, then run mcp__ewm__run_validation again)'
 
-function whyNotPending(task: Task, gate: GateName, profile: Profile): string {
+function whyNotPending(task: TrustedTask, gate: GateName, profile: Profile): string {
   if (gate === 'plan_approval') {
     if (task.phase !== 'PLAN') return `plan_approval is decided in PLAN, but ${task.id} is in ${task.phase}`
     if (!hasPlanSteps(task)) return 'the plan has no steps yet (record it with mcp__ewm__set_plan)'
@@ -134,7 +128,7 @@ function whyNotPending(task: Task, gate: GateName, profile: Profile): string {
 
 /** Appends an Approval (by:'user', plan_hash = planHash(task.plan) for plan_approval). Throws EwmError('invalid_input') if gate !== pendingGate(task, profile). */
 export function recordApproval(
-  task: Task,
+  task: TrustedTask,
   gate: GateName,
   decision: 'approved' | 'rejected',
   via: 'command' | 'pane',
@@ -184,7 +178,7 @@ function checkPlanGate(task: Task, actor: Actor, profile: Profile): Verdict {
   return OK
 }
 
-function checkAcceptanceGate(task: Task, actor: Actor): Verdict {
+function checkAcceptanceGate(task: TrustedTask, actor: Actor): Verdict {
   if (task.validations.length === 0) {
     return gateRequired(
       'ewm: DONE needs at least one validation run (gate done_acceptance). Run an allowed command with mcp__ewm__run_validation first.',
@@ -201,7 +195,7 @@ function checkAcceptanceGate(task: Task, actor: Actor): Verdict {
   return OK
 }
 
-function evaluateTransition(task: Task, to: Phase, actor: Actor, profile: Profile): Verdict {
+function evaluateTransition(task: TrustedTask, to: Phase, actor: Actor, profile: Profile): Verdict {
   const from = task.phase
   if (from === 'PAUSED') {
     return invalid(`ewm: ${task.id} is paused, so it cannot move to ${to}. Run /ewm resume first.`)
@@ -236,13 +230,13 @@ function evaluateTransition(task: Task, to: Phase, actor: Actor, profile: Profil
  *  - UNDERSTAND -> PLAN: actor must be 'user' (CR10);
  *  - reasons name the missing condition and the human action (e.g. "ask the person to run /ewm approve").
  *  The caller passes a task whose approvals/validations are the trusted (ledger) ones. */
-export function checkTransition(task: Task, to: Phase, actor: Actor, profile: Profile): Check {
+export function checkTransition(task: TrustedTask, to: Phase, actor: Actor, profile: Profile): Check {
   const verdict = evaluateTransition(task, to, actor, profile)
   return verdict.ok ? verdict : { ok: false, reason: verdict.reason }
 }
 
 /** Applies a checked transition: phase, transitions[] (+{from,to,actor,reason,at}), next_action (defaultNextAction), updated_at. Throws EwmError('invalid_transition' | 'gate_required'). */
-export function transition(task: Task, to: Phase, actor: Actor, reason: string, at: string, profile: Profile): Task {
+export function transition(task: TrustedTask, to: Phase, actor: Actor, reason: string, at: string, profile: Profile): Task {
   const verdict = evaluateTransition(task, to, actor, profile)
   if (!verdict.ok) throw new EwmError(verdict.code, verdict.reason)
   return {
@@ -281,7 +275,7 @@ export function pause(task: Task, at: string, reason = 'paused'): Task {
  *  A damaged task with no phase to return to restarts at INTAKE (every gate is recomputed from data, so this opens nothing).
  *  With `profile` (the caller passes the trusted task, CR5), a target past PLAN is clamped to PLAN unless the plan gate is
  *  satisfied now, so a forged phase can never skip plan_approval. */
-export function resume(task: Task, at: string, profile?: Profile): Task {
+export function resume(task: TrustedTask, at: string, profile?: Profile): Task {
   if (task.phase !== 'PAUSED') return task
   const recorded = task.paused_from
   const hasTarget = recorded !== null && isActivePhase(recorded)
