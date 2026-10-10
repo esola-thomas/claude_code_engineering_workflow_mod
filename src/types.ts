@@ -275,6 +275,8 @@ export type LedgerEntry = {
   phase: Phase
   /** Source of truth for where a PAUSED task resumes. */
   paused_from: ActivePhase | null
+  /** ISO time of the latest transition into VALIDATE (set by the mod); validation runs count for done_acceptance only from then on. */
+  validating_since?: string | null
   /** Every approval a human recorded for the task (copy of the trusted record). */
   approvals: Approval[]
   /** Every validation run the mod itself executed for the task. */
