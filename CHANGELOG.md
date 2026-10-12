@@ -8,7 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- System map drawn without Mermaid: `src/graph.ts` parses a strict subset of Mermaid flowcharts and lays it out (layers, crossing reduction, orthogonal edges). The pane's Map section draws it as SVG (themed for light and dark, node tooltips) in the desktop app, VS Code and mobile, and as box-drawing text sized to the pane in the terminal. Graphs too wide or over 80 nodes fall back to the list of links.
+- `/ewm map` draws the diagram for the terminal width instead of printing the Mermaid source, and switches the pane to Map. `/ewm questions` switches the pane to Questions.
+- `/ewm map --html` writes `system-map.html`: the diagram, the evidence each node cites, the links, notes, components and the Mermaid source on one page that needs no network and runs no script (a CSP forbids both). The reply carries its `file://` link.
+- Pane sections Plan and Findings, and Plan, Questions and Findings drawn as markdown; a ```mermaid fence in any section is drawn as a diagram.
+- Stale evidence on the map: a node whose label names a path cited by a stale finding is outlined (red in SVG, heavy box in text); its tooltip lists the findings that cite it.
+- `system-map.md` lists the diagram's links.
 - `policies.allowed_commands` in the project profile ([#3](https://github.com/esola-thomas/claude_code_engineering_workflow_mod/issues/3)): command prefixes such as `gh issue list`, `git fetch` or `git push` that the guard lets through. `read_only` entries run in every active phase, `implement` entries in IMPLEMENT and `validate` entries in VALIDATE. Only a plain simple command matches (no pipes, redirections, expansions, globs, assignments or wrappers), network entries need `external_network: allow`, and read-only agents never get them. `/ewm status` shows the active entries, and `/ewm new` and `/ewm resume` warn about entries that can never apply.
+
+### Changed
+
+- `mcp__ewm__write_map` parses the Mermaid source and refuses a syntax error or a non-flowchart diagram with its line and column. `text_map` and `components` are optional: the links are derived from the diagram and the components default to its node labels.
 
 ### Security
 

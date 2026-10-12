@@ -7,7 +7,7 @@ export type EwmCommand =
   | { name: 'new'; title: string; goal?: string } // /ewm new "title" [--goal "text"]
   | { name: 'resume'; id?: string } // /ewm resume [TASK-001]
   | { name: 'status' }
-  | { name: 'map' }
+  | { name: 'map'; html?: boolean } // /ewm map [--html]
   | { name: 'questions' }
   | { name: 'plan' }
   | { name: 'pause' }
@@ -21,7 +21,7 @@ export const USAGE = [
   '/ewm new "<title>" [--goal "<text>"]   start a task',
   '/ewm resume [TASK-001]                 continue a task (default: the active or latest one)',
   '/ewm status                            show phase, counts, models and the next action',
-  '/ewm map                               show the system map',
+  '/ewm map [--html]                      draw the system map; --html also writes system-map.html to open in a browser',
   '/ewm questions                         show open and resolved questions',
   '/ewm plan                              move to PLAN once understood, or show the plan',
   '/ewm pause                             save a checkpoint and leave the workflow',
@@ -190,7 +190,7 @@ function parseResume(rest: string): ParseResult {
   return { name: 'resume', id }
 }
 
-const NO_ARGUMENT_COMMANDS = ['status', 'map', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const
+const NO_ARGUMENT_COMMANDS = ['status', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const
 type NoArgumentName = (typeof NO_ARGUMENT_COMMANDS)[number]
 
 function isNoArgumentCommand(name: string): name is NoArgumentName {
@@ -211,6 +211,12 @@ export function parseCommand(input: string): EwmCommand | { error: string } {
     const note = parseNote(rest)
     if (note === '') return fail('ewm: reject needs a reason, e.g. /ewm reject "the plan skips the migration".')
     return { name: 'reject', note }
+  }
+  if (name === 'map') {
+    const flag = rest.trim()
+    if (flag === '') return { name: 'map' }
+    if (flag === '--html') return { name: 'map', html: true }
+    return fail('ewm: map takes no arguments except --html, e.g. /ewm map --html.')
   }
   if (isNoArgumentCommand(name)) {
     if (rest.trim() !== '') return fail(`ewm: ${name} takes no arguments.`)

@@ -2,7 +2,7 @@
 // Self-contained on purpose (no imports): the PaneModel shape is mirrored from
 // src/types.ts and must be kept in sync with it.
 
-export type EwmPaneSection = 'overview' | 'map' | 'questions'
+export type EwmPaneSection = 'overview' | 'map' | 'plan' | 'questions' | 'findings'
 
 export type EwmPaneView = {
   project: string
@@ -19,6 +19,8 @@ export type EwmPaneView = {
   next_action: string
   map_lines: string[]
   question_lines: string[]
+  map_marks: Record<string, { stale?: boolean; note?: string }>
+  docs: { map: string; plan: string; questions: string; findings: string }
 }
 
 declare module 'claude-code' {
