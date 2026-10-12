@@ -2,10 +2,13 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   formatEvidence,
+  mapMarks,
   paneModel,
   renderDecisions,
   renderExploration,
   renderHandoff,
+  renderMapText,
+  renderMapView,
   renderPhaseRail,
   renderPlan,
   renderQuestions,
@@ -669,6 +672,90 @@ describe('renderSystemMap', () => {
     const text = renderSystemMap(makeTask())
     assert.match(text, /^# System map - TASK-001: Investigate sum\(\)\n\nNo system map recorded yet/)
     assert.doesNotMatch(text, /mermaid\n/)
+  })
+})
+
+describe('the drawn map', () => {
+  const MAP = 'flowchart LR\n  A["src/file1.ts"] -->|calls| B["src/file2.ts (helper)"]\n  B --> C[config]'
+  const withMap = (overrides: Partial<Task> = {}) =>
+    makeTask({ system_map: { mermaid: MAP, text_map: '', components: ['a', 'b'], updated_at: AT }, ...overrides })
+
+  it('system-map.md lists the links of the parsed diagram', () => {
+    assert.match(renderSystemMap(withMap()), /## Links\n\n```text\nsrc\/file1\.ts --calls--> src\/file2\.ts \(helper\)\nsrc\/file2\.ts \(helper\) --> config\n```/)
+  })
+
+  it('map_lines fall back to the links when there are no notes', () => {
+    assert.deepEqual(paneModel(withMap(), makeProfile(), NO_GATE).map_lines, ['src/file1.ts --calls--> src/file2.ts (helper)', 'src/file2.ts (helper) --> config'])
+  })
+
+  it('marks the nodes that name a finding\'s evidence path, stale when a citing finding is stale', () => {
+    const task = withMap({ findings: [makeFinding(1), makeFinding(2, { stale: true }), makeFinding(3)] })
+    const marks = mapMarks(task)
+    assert.deepEqual(Object.keys(marks), ['A', 'B'])
+    assert.equal(marks.A?.stale, undefined)
+    assert.match(marks.A?.note ?? '', /^F-001: Claim number 1$/)
+    assert.equal(marks.B?.stale, true)
+    assert.match(marks.B?.note ?? '', /F-002 \[STALE\]/)
+  })
+
+  it('matches whole paths only', () => {
+    const task = withMap({ findings: [makeFinding(1, { evidence: [{ path: 'src/file1.t' }] }), makeFinding(9, { evidence: [{ path: 'file1.ts' }] })] })
+    assert.deepEqual(mapMarks(task), {})
+  })
+
+  it('has no marks without a parsable map', () => {
+    assert.deepEqual(mapMarks(makeTask()), {})
+    assert.deepEqual(mapMarks(makeTask({ system_map: { mermaid: 'not mermaid', text_map: '', components: [], updated_at: AT } })), {})
+  })
+
+  it('renderMapView puts the diagram first as a mermaid fence, then notes, links and components', () => {
+    const view = renderMapView(withMap({ system_map: { mermaid: MAP, text_map: 'note one', components: ['a'], updated_at: AT } }))
+    assert.match(view, /^```mermaid\nflowchart LR\n/)
+    assert.match(view, /## Notes\n\n- note one/)
+    assert.match(view, /## Links\n\n- `src\/file1\.ts --calls--> src\/file2\.ts \(helper\)`/)
+    assert.match(view, /## Components\n\n- `a`/)
+    assert.match(renderMapView(makeTask()), /No system map yet/)
+  })
+
+  it('renderMapView shows a stored source that does not parse as text, not as a mermaid fence', () => {
+    const view = renderMapView(makeTask({ system_map: { mermaid: 'sequenceDiagram\n A->>B: x', text_map: '', components: [], updated_at: AT } }))
+    assert.doesNotMatch(view, /```mermaid/)
+    assert.match(view, /```text\nsequenceDiagram/)
+  })
+
+  it('renderMapText draws the diagram for the terminal, with notes, components and the file', () => {
+    const text = renderMapText(withMap({ findings: [makeFinding(2, { stale: true })] }), 120, '/repo/.ewm/tasks/TASK-001/system-map.md')
+    assert.match(text, /^System map - TASK-001: Investigate sum\(\)\nUpdated: /)
+    assert.match(text, /│ src\/file1\.ts │──calls─/)
+    assert.match(text, /┏━+┓/)
+    assert.match(text, /evidence went stale/)
+    assert.match(text, /Components: a, b/)
+    assert.match(text, /File: \/repo\/\.ewm\/tasks\/TASK-001\/system-map\.md$/)
+    for (const line of text.split('\n')) assert.ok([...line].length <= 120)
+  })
+
+  it('renderMapText lists the links when the drawing cannot fit, and shows unparsable source as text', () => {
+    const wide = makeTask({ system_map: { mermaid: 'flowchart LR\n A --> B --> C --> D --> E --> F\n A --> G & H & I & J & K', text_map: '', components: [], updated_at: AT } })
+    assert.match(renderMapText(wide, 20, 'f'), /The diagram is wider than 20 columns; the links:\n {2}A --> B\n/)
+    const broken = makeTask({ system_map: { mermaid: 'graph TD\n A -> B', text_map: '', components: [], updated_at: AT } })
+    assert.match(renderMapText(broken, 80, 'f'), /does not parse as a flowchart[^\n]*\n\ngraph TD\n A -> B/)
+    assert.match(renderMapText(makeTask(), 80, 'f'), /No system map recorded yet/)
+  })
+
+  it('the pane model carries each section as markdown and the map marks', () => {
+    const pane = paneModel(withMap({ findings: [makeFinding(1)] }), makeProfile(), NO_GATE)
+    assert.match(pane.docs.map, /^```mermaid/)
+    assert.match(pane.docs.plan, /^# Plan - TASK-001/)
+    assert.match(pane.docs.questions, /^# Questions - TASK-001/)
+    assert.match(pane.docs.findings, /^# Exploration - TASK-001/)
+    assert.deepEqual(Object.keys(pane.map_marks), ['A'])
+  })
+
+  it('cuts a long section for the pane and names the file', () => {
+    const findings = Array.from({ length: 200 }, (_, i) => makeFinding(i + 1, { claim: `${'long claim '.repeat(20)}${i}` }))
+    const pane = paneModel(makeTask({ findings }), makeProfile(), NO_GATE)
+    assert.ok(pane.docs.findings.length <= 30100)
+    assert.match(pane.docs.findings, /_Cut here: the whole document is exploration\.md\._$/)
   })
 })
 

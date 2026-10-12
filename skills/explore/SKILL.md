@@ -21,7 +21,7 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 | mcp__ewm__record_finding | For each verified finding. Input `{claim, evidence[{path, line_start?, line_end?, doc_id?, note?}], confidence, open_questions?, source?}`. | 1-20 evidence items. Each path is repo-relative (no leading "/", no "..", not under `.ewm/`), exists, and has 1 <= line_start <= line_end <= file length. The same claim text updates the existing finding. Set `source` to the scout's agent type, or "lead". |
 | mcp__ewm__question | For each open question. `{action:'add', text}`, later `{action:'resolve', id, answer}`. | Active task. |
 | mcp__ewm__decision | For a decision the person states. `{title, choice, rationale}`. | Active task. |
-| mcp__ewm__write_map | Once the picture is clear; call again to update. `{mermaid, text_map, components[]}`. | `mermaid` is 1-20000 characters. |
+| mcp__ewm__write_map | Once the picture is clear; call again to update. `{mermaid, text_map?, components?}`. | `mermaid` is 1-20000 characters and must parse as a flowchart; an error names the line and column. |
 | mcp__ewm__advance | Last. `{to:'UNDERSTAND', reason}`. | Phase EXPLORE. |
 
 ## Steps
@@ -38,9 +38,9 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 5. Record hypotheses as findings whose claim starts "Hypothesis:" with medium or low confidence. Record a contradiction as a finding with both sides' evidence, and add a question. Add every open question with mcp__ewm__question.
 6. Research in rounds: scouts, verify, record, decide what is still missing. Launch a second round only for real gaps.
 7. Write the map with mcp__ewm__write_map:
-   - `mermaid`: a `flowchart` of at most about 25 nodes. Simple node ids, quoted labels, edges labelled with the relation (calls, reads, configures).
-   - `text_map`: at most about 20 short lines for the pane.
-   - `components`: the component names, one per entry.
+   - `mermaid`: a `flowchart LR` (or `TD`) of at most about 25 nodes. Simple node ids, quoted labels that name the file or module path (`Sum["src/sum.js"]`), edges labelled with the relation (`-->|calls|`, `-->|reads|`, `-.->|configures|`). The mod draws it in the pane and the terminal, and marks a node stale when a finding citing its path goes stale, so put the real path in the label. Supported: node shapes `[] () ([]) [[]] [()] (()) {} {{}}`, edges `--> --- -.-> ==>` with `|label|`, `A & B --> C`, `subgraph id [Label]` ... `end`. If the call is refused, fix the line and column it names.
+   - `text_map` (optional): up to about 10 short notes the arrows cannot say. The links themselves are derived from the diagram.
+   - `components` (optional): the component names; defaults to the node labels.
 
 ## Examples
 

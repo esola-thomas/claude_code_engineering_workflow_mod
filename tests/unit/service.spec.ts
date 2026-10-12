@@ -619,8 +619,12 @@ describe('commands', () => {
     assert.match((await cmd(env, 'map')).text, /No system map/)
     await expectOk(tool(env, 'write_map', { mermaid: 'flowchart LR\n A-->B', text_map: 'A to B', components: ['A', 'B'] }))
     const map = await cmd(env, 'map')
-    assert.match(map.text, /```mermaid/)
+    assert.match(map.text, /│ A │─▶│ B │/)
+    assert.match(map.text, /Notes:\n {2}A to B/)
+    assert.doesNotMatch(map.text, /```mermaid/)
     assert.match(map.text, /system-map\.md/)
+    assert.equal(map.section, 'map')
+    assert.equal(map.openPane, true)
     await expectOk(tool(env, 'question', { action: 'add', text: 'Who owns B?' }))
     assert.match((await cmd(env, 'questions')).text, /Q-001: Who owns B\?/)
   })
@@ -828,7 +832,21 @@ describe('tools', () => {
     await startTask(env)
     await expectRefused(tool(env, 'write_map', { mermaid: '', text_map: 't', components: [] }), /mermaid/)
     await expectRefused(tool(env, 'write_map', { mermaid: 'x'.repeat(20001), text_map: 't', components: [] }), /too long/)
-    await expectOk(tool(env, 'write_map', { mermaid: 'x'.repeat(20000), text_map: 't', components: [] }))
+    const long = `flowchart LR\n  A["${'x'.repeat(19960)}"] --> B`
+    await expectOk(tool(env, 'write_map', { mermaid: long, text_map: 't', components: [] }))
+  })
+
+  it('write_map refuses Mermaid that does not parse, with the line and column, and derives the components', async () => {
+    const env = setup()
+    await startTask(env)
+    await expectRefused(tool(env, 'write_map', { mermaid: 'x'.repeat(100) }), /first line/)
+    await expectRefused(tool(env, 'write_map', { mermaid: 'sequenceDiagram\n  A->>B: hi' }), /"sequenceDiagram" diagrams are not supported/)
+    await expectRefused(tool(env, 'write_map', { mermaid: 'flowchart LR\n  A --> B\n  B -> C' }), /line 3, column \d+: expected an arrow/)
+    await expectRefused(tool(env, 'write_map', { mermaid: 'flowchart LR\n  subgraph api\n  A --> B' }), /subgraph "api" is not closed/)
+    await expectOk(tool(env, 'write_map', { mermaid: 'flowchart LR\n  A[src/a.ts] -->|calls| B[src/b.ts]' }))
+    const task = await taskOf(env)
+    assert.deepEqual(task.system_map?.components, ['src/a.ts', 'src/b.ts'])
+    assert.equal(task.system_map?.text_map, '')
   })
 
   it('records a command that could not start as a failed run', async () => {

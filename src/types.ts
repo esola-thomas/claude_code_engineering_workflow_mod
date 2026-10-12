@@ -325,7 +325,7 @@ export type Staleness = {
 // Pane view model (plain JSON; lives in $.state and is drawn by the mod).
 // ---------------------------------------------------------------------------
 
-export type PaneSection = 'overview' | 'map' | 'questions'
+export type PaneSection = 'overview' | 'map' | 'plan' | 'questions' | 'findings'
 
 export type PaneModel = {
   project: string
@@ -346,6 +346,10 @@ export type PaneModel = {
   map_lines: string[]
   /** "Q-001 text" lines for the 'questions' section. */
   question_lines: string[]
+  /** Overlays for the map's nodes by node id: stale evidence and the findings that cite the node. */
+  map_marks: Record<string, { stale?: boolean; note?: string }>
+  /** Markdown per section; ```mermaid fences in it are drawn as diagrams by the pane. */
+  docs: { map: string; plan: string; questions: string; findings: string }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +367,8 @@ export type CommandOutput = {
   changed: boolean
   /** True when the pane should be opened/focused for this output. */
   openPane?: boolean
+  /** The pane section to show with this output (e.g. 'map' for /ewm map). */
+  section?: PaneSection
 }
 
 export type ToolOutput = {

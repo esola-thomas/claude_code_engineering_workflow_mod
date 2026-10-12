@@ -4,8 +4,11 @@
 // so this module needs neither controller.ts nor router.ts.
 //
 // Output is shown in terminals and in markdown viewers, so structure uses plain
-// ASCII ('>', '-', '#'): no emoji and no ANSI codes.
+// ASCII ('>', '-', '#'): no emoji and no ANSI codes. The one exception is the
+// map drawing (/ewm map), which uses box-drawing characters from graph.ts.
 
+import { adjacencyLines, drawText, parseFlowchart, undrawnNote } from './graph.ts'
+import type { Graph, NodeMark } from './graph.ts'
 import type { ActivePhase, Approval, Evidence, Finding, GateName, PaneModel, Phase, Profile, Question, Staleness, Task, TaskSummary, ValidationRun } from './types.ts'
 
 /** Computed by the caller (service): pendingGate/hasValidApproval on the trusted task, and summarizeModels(task.agent_usage).
@@ -144,12 +147,106 @@ function openQuestions(task: Task): Question[] {
   return task.open_questions.filter(question => question.status === 'open')
 }
 
-/** The text-map lines (blank lines dropped), else the component names. */
+/** The stored diagram parsed, or null when there is none or it does not parse (maps saved before write_map checked the source). */
+export function mapGraph(task: Task): Graph | null {
+  if (task.system_map === null) return null
+  const parsed = parseFlowchart(task.system_map.mermaid)
+  return parsed.ok ? parsed.graph : null
+}
+
+function noteLines(task: Task): string[] {
+  return (task.system_map?.text_map ?? '').split(/\r?\n/).filter(line => line.trim() !== '').map(line => line.trimEnd())
+}
+
+/** The text-map lines (blank lines dropped), else the links of the parsed diagram, else the component names. */
 function mapLinesOf(task: Task): string[] {
   const map = task.system_map
   if (map === null) return []
-  const lines = map.text_map.split(/\r?\n/).filter(line => line.trim() !== '')
-  return lines.length > 0 ? lines.map(line => line.trimEnd()) : [...map.components]
+  const notes = noteLines(task)
+  if (notes.length > 0) return notes
+  const graph = mapGraph(task)
+  if (graph !== null && graph.nodes.length > 0) return adjacencyLines(graph)
+  return [...map.components]
+}
+
+/**
+ * Overlays for the map's nodes: a node whose id or label names the path of a finding's evidence carries that finding in its tooltip,
+ * and is marked stale when any such finding is stale. Paths are matched whole (a label "src/sum.js (bug)" names src/sum.js).
+ */
+export function mapMarks(task: Task): Record<string, NodeMark> {
+  const graph = mapGraph(task)
+  if (graph === null) return {}
+  const marks: Record<string, NodeMark> = {}
+  for (const node of graph.nodes) {
+    const names = `${node.id} ${node.label}`
+    const cited = task.findings.filter(finding =>
+      finding.evidence.some(item => {
+        const at = names.indexOf(item.path)
+        if (at < 0) return false
+        const before = names[at - 1]
+        const after = names[at + item.path.length]
+        return (before === undefined || /[\s("'\[]/.test(before)) && (after === undefined || /[\s)"'\]:,;]/.test(after))
+      }),
+    )
+    if (cited.length === 0) continue
+    const stale = cited.some(finding => finding.stale)
+    marks[node.id] = {
+      ...(stale ? { stale: true } : {}),
+      note: cited.map(finding => `${finding.id}${finding.stale ? ' [STALE]' : ''}: ${clipWords(finding.claim, 16)}`).join('\n'),
+    }
+  }
+  return marks
+}
+
+/** The longest markdown a pane section carries; the file on disk has the rest. */
+const PANE_DOC_CHARS = 30000
+
+function paneDoc(markdown: string, file: string): string {
+  const text = stripControls(markdown).trimEnd()
+  if (text.length <= PANE_DOC_CHARS) return text
+  const cut = text.lastIndexOf('\n', PANE_DOC_CHARS)
+  return `${text.slice(0, cut > 0 ? cut : PANE_DOC_CHARS)}\n\n_Cut here: the whole document is ${file}._`
+}
+
+/** The pane's Map section as markdown: the diagram first (a mermaid fence the pane draws), then the notes, the links and the components. */
+export function renderMapView(task: Task): string {
+  const map = task.system_map
+  if (map === null) return 'No system map yet. The lead records one with mcp__ewm__write_map during EXPLORE or UNDERSTAND.'
+  const graph = mapGraph(task)
+  const blocks: string[] = []
+  if (graph === null) {
+    blocks.push('The stored diagram is not a flowchart this pane can draw; its source is below and in system-map.md.', fence(map.mermaid, 'text'))
+  } else {
+    blocks.push(fence(map.mermaid, 'mermaid'))
+  }
+  const notes = noteLines(task)
+  if (notes.length > 0) blocks.push(section('Notes', bulletList(notes, 'None.')))
+  if (graph !== null && graph.edges.length > 0) blocks.push(section('Links', bulletList(adjacencyLines(graph).map(codeSpan), 'None.')))
+  if (map.components.length > 0) blocks.push(section('Components', bulletList(map.components.map(codeSpan), 'None.')))
+  blocks.push(`Updated ${map.updated_at}`)
+  return blocks.join('\n\n')
+}
+
+/** `/ewm map` in the terminal: the diagram drawn to fit `columns`, else its links, then notes and components. */
+export function renderMapText(task: Task, columns: number, file: string): string {
+  const map = task.system_map
+  const title = `System map - ${task.id}: ${oneLine(task.title)}`
+  if (map === null) return [title, '', 'No system map recorded yet. The lead records one with mcp__ewm__write_map during EXPLORE or UNDERSTAND.'].join('\n')
+  const graph = mapGraph(task)
+  const lines = [title, `Updated: ${map.updated_at}`, '']
+  if (graph === null) {
+    lines.push('The stored diagram does not parse as a flowchart; its links cannot be drawn. Source:', '', ...map.mermaid.split(/\r?\n/).map(stripControls))
+  } else {
+    const width = Math.max(20, columns - 2)
+    const drawing = drawText(graph, { columns: width, marks: mapMarks(task) })
+    if (drawing === null) lines.push(undrawnNote(graph, width), ...adjacencyLines(graph).map(line => `  ${stripControls(line)}`))
+    else lines.push(...drawing)
+  }
+  const notes = noteLines(task)
+  if (notes.length > 0) lines.push('', 'Notes:', ...notes.map(line => `  ${stripControls(line)}`))
+  if (map.components.length > 0) lines.push('', `Components: ${map.components.map(oneLine).join(', ')}`)
+  lines.push('', `File: ${file}`)
+  return lines.join('\n')
 }
 
 /** What to do next in the words of the pending gate (F3), else the task's stored next_action. With a plan or the validation results waiting
@@ -176,6 +273,13 @@ export function paneModel(task: Task, profile: Profile, gate: GateState): PaneMo
     next_action: oneLine(nextActionOf(task, gate)),
     map_lines: mapLinesOf(task).map(stripControls),
     question_lines: openQuestions(task).map(question => `${question.id} ${oneLine(question.text)}`),
+    map_marks: mapMarks(task),
+    docs: {
+      map: paneDoc(renderMapView(task), 'system-map.md'),
+      plan: paneDoc(renderPlan(task, gate), 'plan.md'),
+      questions: paneDoc(renderQuestions(task), 'questions.md'),
+      findings: paneDoc(renderExploration(task), 'exploration.md'),
+    },
   }
 }
 
@@ -380,16 +484,19 @@ export function renderValidation(task: Task): string {
   return document(...blocks)
 }
 
-/** system-map.md: heading, text map, components list, ```mermaid block; a placeholder line when task.system_map is null. */
+/** system-map.md: heading, text map, links (from the parsed diagram), components list, ```mermaid block; a placeholder line when task.system_map is null. */
 export function renderSystemMap(task: Task): string {
   const map = task.system_map
   if (map === null) {
     return document(heading('System map', task), 'No system map recorded yet. The lead records one with mcp__ewm__write_map during EXPLORE or UNDERSTAND.')
   }
+  const graph = mapGraph(task)
+  const links = graph === null || graph.edges.length === 0 ? [] : [section('Links', fence(adjacencyLines(graph).join('\n'), 'text'))]
   return document(
     heading('System map', task),
     `Updated: ${map.updated_at}`,
     section('Text map', map.text_map.trim() === '' ? 'None.' : fence(map.text_map, 'text')),
+    ...links,
     section('Components', bulletList(map.components, 'None.')),
     section('Diagram', fence(map.mermaid, 'mermaid')),
   )

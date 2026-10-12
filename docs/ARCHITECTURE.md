@@ -16,6 +16,7 @@ src/controller.ts      FSM, gates, approvals (pure)
 src/policies.ts        tool-call verdicts, Bash classifier (pure)
 src/router.ts          model routing for subagents (pure)
 src/render.ts          text, markdown, pane model, resume brief (pure)
+src/graph.ts           Mermaid flowchart subset: parse, lay out, draw as text or SVG (pure)
 src/store.ts           task store + gate ledger over Io (paths, ids, json, artifacts, audit)
 src/profile.ts         profile load + YAML subset parser + defaults (over Io)
 src/args.ts            /ewm argument parsing (pure)
@@ -312,6 +313,40 @@ export function modelFamily(model: string): string
 export function summarizeModels(uses: readonly AgentUse[]): string[]
 ```
 
+## src/graph.ts (pure)
+
+Mermaid is not available in the hooks environment (no DOM, no npm), and no surface renders it. The system map is a strict subset of
+Mermaid's flowchart syntax that this module parses, lays out and draws itself, so the same source reads the same in system-map.md
+(real Mermaid, for GitHub and other viewers), in the terminal (box-drawing text) and on desktop, VS Code and mobile (SVG).
+
+Subset: `flowchart|graph [TD|TB|BT|LR|RL]`; node shapes `[] () ([]) [[]] [()] (()) {} {{}} >] [/ /]`; quoted or plain labels (`<br>` becomes a
+space, other tags are dropped, `#quot;` and `#NN;` decode); edges `--> --- -.-> -.- ==> ===` with `<`, `o`, `x` ends, longer variants,
+`|label|` and `-- label -->` / `-. label .->` / `== label ==>` forms, `~~~` (kept for layout, not drawn); `A & B --> C & D` chains; `;` separators;
+`subgraph id [label]` / `subgraph "label"` ... `end`; `%%` comments and directives; YAML front matter. `classDef`, `class`, `style`, `linkStyle`,
+`click`, `direction`, `accTitle`, `accDescr` are accepted and ignored. Other diagram types are refused with a message naming the fix.
+
+```ts
+export type Graph = { direction: Direction; nodes: GraphNode[]; edges: GraphEdge[]; subgraphs: Subgraph[] }
+/** Errors carry 1-based line and column; at most 8; a node (300) or edge (600) limit stops the parse. */
+export function parseFlowchart(source: string): { ok: true; graph: Graph } | { ok: false; errors: ParseError[] }
+export function formatParseErrors(errors: readonly ParseError[]): string   // "line 3, column 5: ...; ..."
+/** "a --calls--> b" per edge (Mermaid's spelling), then "x (no links)", then "Group g: a, b": the fallback list and the SVG alt text. */
+export function adjacencyLines(graph: Graph): string[]
+/** Layered layout on a cell grid: DFS cycle breaking, longest-path ranks (sources pulled next to their first successor), dummy nodes on long
+ *  edges, barycenter sweeps keeping subgraph members together (best crossing count wins), ports spread per side, orthogonal routing with one
+ *  track per bent segment in each channel, edge labels on the first run (LR) or beside the line (TD, else listed as unplaced). BT and RL mirror. */
+export function layoutGraph(graph: Graph, options: { direction: Direction; labelWidth: number; ascii: boolean }): Layout
+/** Text lines that fit `columns`: the declared direction, then the other axis, then narrower labels; null when nothing fits or the graph has
+ *  more than MAX_DRAWN_NODES (80) nodes. Unplaced labels and self-loops are listed under the drawing; stale nodes (marks) get a heavy box and a legend. */
+export function drawText(graph: Graph, options?: { columns?: number; ascii?: boolean; marks?: Record<string, NodeMark> }): string[] | null
+export function undrawnNote(graph: Graph, columns: number): string   // why drawText returned null
+/** A standalone SVG (light and dark through prefers-color-scheme, node tooltips from marks, dashed subgraph frames); every label is XML-escaped.
+ *  Null when the graph is empty, has more than 80 nodes, or the markup exceeds MAX_SVG_CHARS (131072, the Svg element's limit). */
+export function drawSvg(graph: Graph, options?: { marks?: Record<string, NodeMark>; title?: string }): string | null
+/** Markdown split into plain runs and ```mermaid (or ~~~mermaid) fenced blocks; other fences are copied whole, an unclosed fence stays text. */
+export function splitMermaid(markdown: string): DocSegment[]
+```
+
 ## src/render.ts (pure)
 
 Render imports neither controller.ts nor router.ts: the caller passes gate state and model lines in.
@@ -330,7 +365,9 @@ export function shortHash(hash: string): string
  *  while 'done_acceptance' "Review the validation results and run /ewm approve to accept closure (or /ewm reject <reason>)", else the stored task.next_action (which is never rewritten). */
 export function nextActionOf(task: Task, gate?: GateState): string
 /** counts.components = task.system_map.components.length (0 when null); sources = distinct evidence paths; risks = plan risks; stale = stale findings.
- *  map_lines = text_map lines (else components); question_lines = open questions "Q-001 text"; models = gate.models; plan = gate.plan while pending_gate is 'plan_approval', else null
+ *  map_lines = text_map lines (else the parsed diagram's adjacencyLines, else components); map_marks = mapMarks(task);
+ *  docs = { map: renderMapView, plan: renderPlan, questions: renderQuestions, findings: renderExploration }, each cut at 30000 characters
+ *  with a line naming the file; question_lines = open questions "Q-001 text"; models = gate.models; plan = gate.plan while pending_gate is 'plan_approval', else null
  *  (PaneModel.plan = { hash (full), steps, summary }). All model-written text is stripped of control characters. */
 export function paneModel(task: Task, profile: Profile, gate: GateState): PaneModel
 /** The text fallback of the pane (SPEC §2 panel as plain text, <= 20 lines): project, task, phase rail, counts, models, pending gate + how to act, next action. */
@@ -341,8 +378,16 @@ export function renderQuestions(task: Task): string
 export function renderDecisions(task: Task): string    // goal, success criteria, constraints, decisions, approvals (gate, decision, via, at, note), transitions
 export function renderPlan(task: Task, gate: GateState): string  // summary, steps with status + files, risks, tests, alternatives, approval state
 export function renderValidation(task: Task): string   // each run: command, exit code, ok, duration, commit, output tail in a fenced block
-/** system-map.md: heading, text map, components list, ```mermaid block; a placeholder line when task.system_map is null. */
+/** system-map.md: heading, text map, links (adjacencyLines of the parsed diagram), components list, ```mermaid block; a placeholder line when task.system_map is null. */
 export function renderSystemMap(task: Task): string
+/** The stored diagram parsed, or null (no map, or a map saved before write_map checked the source). */
+export function mapGraph(task: Task): Graph | null
+/** Node overlays: a node whose id or label names a finding's evidence path (whole path) gets the findings in `note`, and `stale` when one is stale. */
+export function mapMarks(task: Task): Record<string, NodeMark>
+/** The pane's Map section: the ```mermaid fence first (drawn by the pane), then notes, links and components. A source that does not parse is shown as text. */
+export function renderMapView(task: Task): string
+/** /ewm map: title, the drawing sized to `columns` (with stale marks), else the links with undrawnNote; then notes, components and `File: <path>`. */
+export function renderMapText(task: Task, columns: number, file: string): string
 /** DONE handoff: summary, goal, success criteria, decisions, files changed (given), validations, open questions, follow-ups. */
 export function renderHandoff(task: Task, changedFiles: readonly string[]): string   // Summary includes "Diff review: ..." from the ewm:reviewer spawns in agent_usage (CR15)
 /** Resume brief readable in <= 60 s: <= 180 words. Where we were (phase), approved gates, decisions, open questions (max 5), stale evidence, next action.
@@ -356,7 +401,7 @@ export function renderResumeBrief(task: Task, staleness: Staleness, gate?: GateS
 export type Ctx = { io: Io; root: string }   // root is absolute
 export const TOOL_SPECS: readonly { name: string; description: string; inputSchema: Record<string, unknown> }[]
 /** Parses and runs one /ewm command. `via` is 'pane' when invoked from a pane button. Never throws: EwmError becomes { text: message, changed: false }. */
-export async function runCommand(ctx: Ctx, args: string, via: 'command' | 'pane'): Promise<CommandOutput>
+export async function runCommand(ctx: Ctx, args: string, via: 'command' | 'pane', options?: { columns?: number }): Promise<CommandOutput>  // columns: the terminal width for /ewm map (80 when absent)
 /** Runs one model tool by short name (e.g. 'record_finding'). Never throws: errors become { ok: false, text }. */
 export async function runTool(ctx: Ctx, name: string, input: Record<string, unknown>): Promise<ToolOutput>
 /** For the policy guard (F1). Reads the ledger first; returns { task: null, profile: DEFAULT_PROFILE, phase: null } when no task is active WITHOUT touching any other file.
@@ -440,7 +485,7 @@ export function engineIo(source: EngineIoSource): Io
 - `tool.call` (all tools) guard: check the `mcp__ewm__` prefix and the read-only-agent rule without file access first where possible; otherwise `activeContext` + agent type from `$.agent.list()` by `e.agentId` + resolved write path (CR17: `$.fs.stat(path, { resolve: true }).realPath` of the nearest existing ancestor plus the remaining segments, `..` folded; unresolvable -> denied) -> `evaluateToolCall` with the LEDGER phase from `activeContext` (F1); on deny return `{ deny: reason }` and `recordDenial`; when the task's files are missing every deny reason ends with "TASK-NNN's files are missing: run /ewm status to see options (/ewm list deactivates it)"; a malformed ledger denies with the ledger error's own message (it names /ewm reset). Registered with the fail-closed `.catch(($, e, next) => next.called ? next(e) : { deny: 'ewm: policy guard failed; denied to stay safe' })`. Inert (no file reads beyond the ledger) without an active running task.
 - `agent.spawn`: for `ewm:*` types, `routeModel` (rewrite `e.model`) and, when `$.agent.list()` exposes running state, deny an (N+1)th concurrent ewm scout where N = `budgets.max_parallel_researchers`; `await next(e)`; then `recordAgentSpawn` with the resolved `model`, the `routed_model` and `agentId`. Refresh view.
 - `turn.complete`: `recordUsage` from the turn's usage when present.
-- Pane: `$.ui.open({ id: 'ewm', title: 'Engineering Workflow' })`; `ui.render {component:'Pane', requestId:'ewm'}` draws `PaneModel` from `$.state` (`ewm.view`, `ewm.section`, `ewm.notice`; `ewm.root` holds the pinned root across hot reloads): header, rail, counts, models, next action, and buttons `Map`, `Questions`, `Overview`, `Approve` (only with a pending gate; a press is a human origin). The pane also shows `Project: <profile_id>` and, while plan_approval is pending, `Plan <hash8> · N steps: <summary>`. Approve calls `runCommand(ctx, 'approve --plan <full hash of the plan drawn>', 'pane')`, so a plan replaced after the pane drew it is refused. Works on `terminal` and `desktop`.
+- Pane: `$.ui.open({ id: 'ewm', title: 'Engineering Workflow' })`; `ui.render {component:'Pane', requestId:'ewm'}` draws `PaneModel` from `$.state` (`ewm.view`, `ewm.section`, `ewm.notice`; `ewm.root` holds the pinned root across hot reloads): header, rail, and the section: Overview (counts, models, next action as text) or Map, Plan, Questions, Findings (`view.docs[section]` split by `splitMermaid`: markdown runs as `Markdown`, mermaid fences as diagrams: `Svg` with the links as `alt` on every surface but the terminal, box-drawing `Text` sized to `e.props.bodyColumns` in the terminal, the links when it does not fit, `Code` when the source does not parse; the Map section applies `view.map_marks`). Buttons `Overview` (o), `Map` (m), `Plan` (p), `Questions` (q), `Findings` (f), `Approve` (a, only with a pending gate; a press is a human origin). A command output with `section` (`/ewm map`, `/ewm questions`) switches the pane to it. The surface, not the element table, decides SVG versus text: the terminal's table answers `Svg` with an empty fragment. The pane also shows `Project: <profile_id>` and, while plan_approval is pending, `Plan <hash8> · N steps: <summary>`. Approve calls `runCommand(ctx, 'approve --plan <full hash of the plan drawn>', 'pane')`, so a plan replaced after the pane drew it is refused. Works on `terminal`, `desktop`, `vscode` and `mobile`.
 - Status line: `$.ui.status(statusLine)` after every change; cleared when no task is running.
 
 ## Plugin content

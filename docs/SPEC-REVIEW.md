@@ -24,7 +24,7 @@ decision. None changes the product promise.
 | `agent.spawn` hooks see and can rewrite `model` and get back `{ model, agentId }`. | Model router lives in the hook, and every spawn's actual model is recorded (AC4). |
 | `command.run` carries `origin.kind` (`composer`, `bridge`, `sdk`, `plugin`, ...). | Gate approvals accept only human origins. The model cannot approve its own plan. |
 | `$.tool.register` exposes typed tools `mcp__ewm__<name>` to the model. | Findings, questions, decisions, plan, map and validation runs are written through schema-checked tools, not free-form file writes. |
-| `$.ui.open` + `ui.render` (`Pane`) draw a native pane on terminal and desktop; `$.ui.status` sets a status line. Mermaid is not rendered. | Pane shows text; Mermaid goes to `system-map.md`. `/ewm status` text is the fallback when no pane is placed. |
+| `$.ui.open` + `ui.render` (`Pane`) draw a native pane on terminal and desktop; `$.ui.status` sets a status line. No surface renders Mermaid, but desktop, VS Code and mobile draw an `Svg` element, every surface draws `Markdown`, and the render hook knows the pane width (`bodyColumns`). | The mod parses a Mermaid flowchart subset itself (`src/graph.ts`) and draws it as SVG on desktop, VS Code and mobile and as box-drawing text in the terminal and in `/ewm map`; the other sections are drawn as `Markdown`. `system-map.md` keeps the Mermaid source. `/ewm status` text is the fallback when no pane is placed. |
 | `claude plugin test` runs `*.test.ts` against the real engine, offline and without auth. `claude -p --plugin-dir` loads the mod headless. | CI can run the mod tests; acceptance can be proven end to end with real models. |
 
 ## Defects in the spec (fixed here)

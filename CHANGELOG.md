@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- System map drawn without Mermaid: `src/graph.ts` parses a strict subset of Mermaid flowcharts and lays it out (layers, crossing reduction, orthogonal edges). The pane's Map section draws it as SVG (themed for light and dark, node tooltips) in the desktop app, VS Code and mobile, and as box-drawing text sized to the pane in the terminal. Graphs too wide or over 80 nodes fall back to the list of links.
+- `/ewm map` draws the diagram for the terminal width instead of printing the Mermaid source, and switches the pane to Map. `/ewm questions` switches the pane to Questions.
+- Pane sections Plan and Findings, and Plan, Questions and Findings drawn as markdown; a ```mermaid fence in any section is drawn as a diagram.
+- Stale evidence on the map: a node whose label names a path cited by a stale finding is outlined (red in SVG, heavy box in text); its tooltip lists the findings that cite it.
+- `system-map.md` lists the diagram's links.
+
+### Changed
+
+- `mcp__ewm__write_map` parses the Mermaid source and refuses a syntax error or a non-flowchart diagram with its line and column. `text_map` and `components` are optional: the links are derived from the diagram and the components default to its node labels.
+
 ## [0.0.0] - 2026-10-10
 
 ### Added
