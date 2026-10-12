@@ -282,7 +282,9 @@ export type PolicyCall = {
  *  4. ALWAYS_DENIED_TOOLS -> deny.
  *  5. Skill whose input.skill is 'ewm' (the slash command, not 'ewm:<stage>' skills) -> deny: the model must not run /ewm commands.
  *  6. WRITE_TOOLS whose target is under <root>/.ewm/ (resolvedPath, else raw path containing a '.ewm' segment, else unresolvable) -> deny (D14).
- *  7. Bash or Monitor (input.command; Monitor with input.ws -> deny) : class 'destructive' -> deny; class 'network' under deny_by_default -> deny;
+ *  7. Bash or Monitor (input.command; Monitor with input.ws -> deny) : a policies.allowed_commands entry for the phase matches -> allow (issue #3: one plain
+ *     simple command starting with the entry's words, no forbidden push or gh api write form, not mentioning '.ewm'; network ones need external_network
+ *     'allow'; read_only entries never lift 'destructive'; never for read-only agents, rule 2 comes first); class 'destructive' -> deny; class 'network' under deny_by_default -> deny;
  *     text mentioning '.ewm' and class not 'read_only' -> deny (D14, best effort). "Mentioning" includes building the name: the text with quotes, backslashes, `+`
  *     and `,` removed (`'.e'+'wm'`, `.e""wm`), an unquoted glob or brace group that can match `.ewm` (`.e*m`, `.e?m`, `.{e,x}wm`; a leading wildcard never matches the dot),
  *     a word mixing an expansion with literal text that fits inside `.ewm` (`${d}wm`, `.e$x`), an assignment of `.e`, `.ew`, `ew`, `ewm` or `wm`, and `dotglob`.

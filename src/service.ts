@@ -10,7 +10,7 @@ import { parseCommand, splitArgs, USAGE } from './args.ts'
 import type { EwmCommand } from './args.ts'
 import { checkTransition, defaultNextAction, hasValidApproval, pause, pendingGate, planHash, recordApproval, resume, transition } from './controller.ts'
 import { formatParseErrors, parseFlowchart } from './graph.ts'
-import { classifyBash } from './policies.ts'
+import { allowedCommandWarnings, classifyBash } from './policies.ts'
 import { DEFAULT_PROFILE, loadProfile } from './profile.ts'
 import {
   paneModel,
@@ -611,7 +611,7 @@ async function cmdNew(ctx: Ctx, command: Extract<EwmCommand, { name: 'new' }>): 
   const text = [
     `Started ${id}: ${command.title}`,
     ...(pausedNote === null ? [] : [pausedNote]),
-    ...warningLines([...warnings, ...validationWarnings(profile)]),
+    ...warningLines([...warnings, ...validationWarnings(profile), ...allowedCommandWarnings(profile)]),
     '',
     statusOf(saved.task, saved.ledger, profile),
   ].join('\n')
@@ -691,7 +691,7 @@ async function cmdResume(ctx: Ctx, command: Extract<EwmCommand, { name: 'resume'
       ? []
       : ['', 'The project profile changed since the last snapshot and applies from now on:', ...changes.map(change => `  - ${change}`), 'If you did not edit .ewm/project.yaml yourself, check it before continuing.']
   const resetNotice = known === undefined ? [ledgerResetNotice(raw, saved.task)] : []
-  const text = [brief, ...resetNotice.flatMap(line => ['', line]), ...(pausedNote === null ? [] : ['', pausedNote]), ...profileNotice, ...warningLines([...warnings, ...validationWarnings(profile)])].join('\n')
+  const text = [brief, ...resetNotice.flatMap(line => ['', line]), ...(pausedNote === null ? [] : ['', pausedNote]), ...profileNotice, ...warningLines([...warnings, ...validationWarnings(profile), ...allowedCommandWarnings(profile)])].join('\n')
   return {
     text,
     context: [brief, ...resetNotice, 'Do not repeat side-effecting operations; re-verify stale evidence before relying on it.'],

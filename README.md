@@ -93,10 +93,13 @@ The profile is `.ewm/project.yaml`. If that file is absent, `.ewm/project.json` 
 | `repositories` | `["."]` | Repository roots. Recorded only; v0.0.0 works on one repository. |
 | `domains` | `[]` | Business areas the project covers. Recorded only. |
 | `entrypoints` | `["README.md", "docs/"]` | Where exploration starts. The explore stage reads it. |
-| `policies.external_network` | `deny_by_default` | `deny_by_default` blocks web, outbound, third-party MCP and network commands while a task is active. `allow` lifts those rules. See [Security model](#security-model). |
+| `policies.external_network` | `deny_by_default` | `deny_by_default` blocks web, outbound, third-party MCP and network commands while a task is active. `allow` lifts them, except that before IMPLEMENT and in VALIDATE a network Bash command still needs `policies.allowed_commands`. See [Security model](#security-model). |
 | `policies.require_plan_approval` | `true` | `false` removes gate 1: the lead can then move from PLAN to IMPLEMENT without `/ewm approve`. |
 | `policies.allow_write_in_explore` | `false` | `true` lets Edit and Write change the repository during EXPLORE. Bash stays read-only before IMPLEMENT. |
 | `policies.allowed_mcp_tools` | `[]` | Third-party MCP tools allowed while a task is active. Exact names, or a prefix ending in `*`. |
+| `policies.allowed_commands.read_only` | `[]` | Command prefixes allowed in every active phase, such as `gh issue list` or `git fetch`. See [Allowed commands](#allowed-commands). |
+| `policies.allowed_commands.implement` | `[]` | Command prefixes allowed in IMPLEMENT even when destructive, such as `git push`. |
+| `policies.allowed_commands.validate` | `[]` | Command prefixes allowed in VALIDATE, such as `gh pr create`. |
 | `models.lead` | `opus` | Recorded only in v0.0.0. The mod does not change the model of the main conversation. |
 | `models.search` | `haiku` | Model for `ewm:repo-scout` and `ewm:docs-scout`. |
 | `models.reviewer` | `sonnet` | Model for `ewm:reviewer`. |
@@ -133,18 +136,46 @@ During an active task the phase decides what runs:
 | Phase | Allowed by the mod |
 |---|---|
 | INTAKE, EXPLORE, UNDERSTAND, PLAN | Read tools (Read, Glob, Grep and similar), read-only Bash, and the `mcp__ewm__*` tools. Edit, Write, MultiEdit and NotebookEdit are denied, except in EXPLORE with `allow_write_in_explore`. |
-| IMPLEMENT | Edit and Write on the repository, subject to Claude Code's own permissions. Bash is left to those permissions, except destructive and network commands, which are denied. |
+| IMPLEMENT | Edit and Write on the repository, subject to Claude Code's own permissions. Bash is left to those permissions, except destructive commands, and network commands under `deny_by_default`, which are denied. |
 | VALIDATE | Read tools, read-only Bash, and the profile's validation commands. Run them with `mcp__ewm__run_validation`, which records the result, or as an exact Bash command, which is not recorded. Edits are denied; go back to IMPLEMENT to change files. |
 
 In every active phase:
 
-- Destructive commands are denied: `git push`, `git reset --hard`, `git clean` with `-f`, `-d` or `-x`, `git checkout .` and `git restore .`, `rm` with both recursive and force in any spelling, `find -delete`, `sudo`, `doas`, `mkfs`, `dd of=` and `shred`. Wrappers such as `env`, `xargs`, `timeout` and `sh -c` are unwrapped first.
+- Destructive commands are denied unless `policies.allowed_commands` lists them for the phase: `git push`, `git reset --hard`, `git clean` with `-f`, `-d` or `-x`, `git checkout .` and `git restore .`, `rm` with both recursive and force in any spelling, `find -delete`, `sudo`, `doas`, `mkfs`, `dd of=` and `shred`. Wrappers such as `env`, `xargs`, `timeout` and `sh -c` are unwrapped first.
 - Writes under `.ewm/` are denied. Workflow state changes only through the `mcp__ewm__*` tools.
 - `EnterWorktree` and `ExitWorktree` are denied, so the session stays in the pinned workspace root.
 - The model cannot run `/ewm` through the Skill tool.
 - Scouts and the reviewer may only read and search, run read-only commands and call `mcp__ewm__status`. They cannot edit, even in IMPLEMENT.
 
-Network, with the default `policies.external_network: deny_by_default`: while a task is active the mod denies WebFetch, WebSearch, outbound tools (Artifact, ArtifactData, ArtifactComments, SendFile, SendUserFile, SendMessage, PushNotification, RemoteTrigger, PublishPlugin, DesignSync), third-party MCP tools not listed in `policies.allowed_mcp_tools`, and network commands (curl, wget, ssh, scp, rsync, nc, gh, and git fetch, pull, clone or ls-remote, among others). Setting `allow` lifts these rules. Third-party MCP tools still need `allowed_mcp_tools` before IMPLEMENT.
+Network, with the default `policies.external_network: deny_by_default`: while a task is active the mod denies WebFetch, WebSearch, outbound tools (Artifact, ArtifactData, ArtifactComments, SendFile, SendUserFile, SendMessage, PushNotification, RemoteTrigger, PublishPlugin, DesignSync), third-party MCP tools not listed in `policies.allowed_mcp_tools`, and network commands (curl, wget, ssh, scp, rsync, nc, gh, and git fetch, pull, clone or ls-remote, among others). Setting `allow` lifts these rules for the tools, and for network Bash commands in IMPLEMENT only. Before IMPLEMENT and in VALIDATE only read-only commands run, and a network command is never read-only, so `gh issue list` or `git fetch` there also needs an entry in `policies.allowed_commands`. Third-party MCP tools still need `allowed_mcp_tools` before IMPLEMENT.
+
+| Bash command | INTAKE to PLAN | IMPLEMENT | VALIDATE |
+|---|---|---|---|
+| Network (`gh`, `git fetch`, `curl`), `deny_by_default` | denied | denied | denied |
+| Network, `allow` | denied unless in `allowed_commands.read_only` | allowed | denied unless in `allowed_commands.read_only` or `.validate` |
+| `git push` (plain), `allow` | denied | denied unless in `allowed_commands.implement` | denied unless in `allowed_commands.validate` |
+
+### Allowed commands
+
+`policies.allowed_commands` widens the guard for specific commands and keeps it on for everything else. Each entry is a prefix of plain words: a program and at least one subcommand.
+
+```yaml
+policies:
+  external_network: allow
+  allowed_commands:
+    read_only: ["gh issue list", "gh issue view", "gh pr view", "gh pr checks", "gh run view", "git fetch"]
+    implement: ["git push", "gh pr create"]
+    validate: ["gh pr create"]
+```
+
+- `read_only` entries run in every active phase, `implement` entries in IMPLEMENT and `validate` entries in VALIDATE. Only `implement` and `validate` entries can allow a destructive command such as `git push`; a `read_only` entry for one is ignored with a warning.
+- A command matches when it is one simple command whose first words are the entry's words: `gh issue list --repo owner/name --state open` matches `gh issue list`, and `gh issue close 1` does not. The words after the prefix are free, so list narrow prefixes.
+- The command must be written plainly: no pipe, `;`, `&&`, redirection (other than `2>/dev/null` and `2>&1`), variable, substitution, glob, `VAR=value` prefix or wrapper such as `env`, `timeout`, `xargs` or `sh -c`. Such a command falls back to the normal rules.
+- Entries for commands that use the network apply only with `external_network: allow`.
+- These never run, whatever the profile lists: `git push` with `--force`, `-f`, `--force-with-lease`, `--delete`, `-d`, `--mirror`, `--prune`, a `+refspec` or a `:ref`; `gh api` with a method other than GET, or with fields and no method (gh then sends POST); git with `--upload-pack`, `--receive-pack`, `--exec` or `--output`.
+- An entry that names a shell, `env`, `xargs`, `timeout`, `eval`, `sudo` or another command runner, a single word, or shell syntax is ignored. `/ewm new` and `/ewm resume` print a warning for each ignored entry and for network entries under `deny_by_default`.
+- `/ewm status` shows the active entries on an `Allowed commands:` line.
+- Scouts and the reviewer never get these. They stay limited to read-only commands.
 
 Gates and state: the model has no approve tool. `/ewm approve` and `/ewm reject` run only from a human origin, and an approval is bound to the plan's SHA-256 hash. Approvals, the validation runs that count for gates, the active task and the phase are kept in the mod's own store in Claude Code's config directory, outside the repository. Editing `task.json` cannot open a gate. Secrets such as `KEY=value` pairs, bearer tokens, URL passwords, common provider keys, JWTs and PEM keys are redacted before anything is written to the audit log or to validation output.
 

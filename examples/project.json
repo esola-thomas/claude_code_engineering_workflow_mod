@@ -8,7 +8,12 @@
     "external_network": "deny_by_default",
     "require_plan_approval": true,
     "allow_write_in_explore": false,
-    "allowed_mcp_tools": ["mcp__github__issue_read", "mcp__github__pull_request_read"]
+    "allowed_mcp_tools": ["mcp__github__issue_read", "mcp__github__pull_request_read"],
+    "allowed_commands": {
+      "read_only": ["gh issue view", "gh pr view", "git fetch"],
+      "implement": ["git push"],
+      "validate": ["gh pr create"]
+    }
   },
   "models": {
     "lead": "opus",
