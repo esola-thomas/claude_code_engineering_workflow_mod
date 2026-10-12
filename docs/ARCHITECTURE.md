@@ -71,7 +71,8 @@ do not change it. All `Io` paths are absolute (`joinPath(root, ...)`), and every
 └── tasks/TASK-001/
     ├── task.json       the Task (pretty JSON, 2-space indent, trailing newline)
     ├── audit.jsonl     AuditEntry per line
-    └── exploration.md system-map.md questions.md plan.md validation.md decisions.md handoff.md
+    ├── exploration.md system-map.md questions.md plan.md validation.md decisions.md handoff.md
+    └── system-map.html  only after /ewm map --html; rewritten on each run, read by nothing
 $.store  "ledger:<root>" -> Ledger
 ```
 
@@ -83,7 +84,7 @@ export function splitArgs(input: string): string[]
 export type EwmCommand =
   | { name: 'new'; title: string; goal?: string }        // /ewm new "title" [--goal "text"]
   | { name: 'resume'; id?: string }                       // /ewm resume [TASK-001]
-  | { name: 'status' } | { name: 'map' } | { name: 'questions' } | { name: 'plan' }
+  | { name: 'status' } | { name: 'map'; html?: boolean } | { name: 'questions' } | { name: 'plan' }   // /ewm map [--html]
   | { name: 'pause' } | { name: 'reset' } | { name: 'list' } | { name: 'help' }  // reset: back up the gate ledger and start an empty one (F2)
   | { name: 'approve'; note?: string; plan?: string }     // /ewm approve [--plan <hash>] [note...]  (plan: lower-case hex prefix, 8-64 digits)
   | { name: 'reject'; note: string }                      // /ewm reject <reason...>  (note required)
@@ -388,6 +389,9 @@ export function mapMarks(task: Task): Record<string, NodeMark>
 export function renderMapView(task: Task): string
 /** /ewm map: title, the drawing sized to `columns` (with stale marks), else the links with undrawnNote; then notes, components and `File: <path>`. */
 export function renderMapText(task: Task, columns: number, file: string): string
+/** system-map.html (/ewm map --html): one self-contained page, CSP `default-src 'none'` (no script, no network): the SVG, an
+ *  "Evidence on the map" table (mapMarks), links, notes, components and the Mermaid source. Every model-written string is HTML-escaped. */
+export function renderMapHtml(task: Task): string
 /** DONE handoff: summary, goal, success criteria, decisions, files changed (given), validations, open questions, follow-ups. */
 export function renderHandoff(task: Task, changedFiles: readonly string[]): string   // Summary includes "Diff review: ..." from the ewm:reviewer spawns in agent_usage (CR15)
 /** Resume brief readable in <= 60 s: <= 180 words. Where we were (phase), approved gates, decisions, open questions (max 5), stale evidence, next action.

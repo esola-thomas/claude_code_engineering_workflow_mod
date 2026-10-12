@@ -32,7 +32,7 @@ To stop at any point, run `/ewm pause`. In a new session, `/ewm resume TASK-001`
 | `/ewm new "<title>" [--goal "<text>"]` | Start a task in INTAKE. A running task is paused first. | You |
 | `/ewm resume [TASK-001]` | Continue the given task, else the active one, else the most recently updated open one. Prints a resume brief. | You |
 | `/ewm status` | Phase, counts, models used, pending gate and next action. | Any |
-| `/ewm map` | Draw the system map in the terminal (sized to its width; the links as a list when it does not fit) and switch the pane to Map. | Any |
+| `/ewm map [--html]` | Draw the system map in the terminal (sized to its width; the links as a list when it does not fit) and switch the pane to Map. `--html` also writes `system-map.html` next to `system-map.md` and prints its `file://` link: one page with the diagram, the evidence each node cites, the links, notes and the Mermaid source. It loads nothing from the network and runs no script. | Any |
 | `/ewm questions` | Show open and resolved questions, and switch the pane to Questions. | Any |
 | `/ewm plan` | In UNDERSTAND, move to PLAN. In PLAN or later, show the plan. In INTAKE or EXPLORE, explain the path to PLAN. | You |
 | `/ewm pause` | Save a checkpoint and leave the workflow. | You |
@@ -161,6 +161,7 @@ What it does not protect against is listed under "Known limits" in [docs/SPEC-RE
     ├── audit.jsonl       one line per event; rotates to audit.1.jsonl past 1 MiB
     ├── exploration.md    findings with evidence and staleness
     ├── system-map.md     map: notes, links, components and the Mermaid source
+    ├── system-map.html   written by /ewm map --html: the drawn map as a page
     ├── questions.md
     ├── decisions.md
     ├── plan.md

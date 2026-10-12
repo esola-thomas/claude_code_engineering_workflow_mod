@@ -98,6 +98,9 @@ test('/ewm map draws the diagram for the terminal width and switches the pane to
   expect(out.text).toContain('calls')
   expect(out.text).not.toContain('```mermaid')
   expect(await pane.find({ type: 'Text', text: /│ src\/sum\.js │/ })).toBeDefined()
+  const page = await h.ewm('map --html')
+  expect(page.text).toContain('Page: file://')
+  expect(page.text).toContain('system-map.html')
   await pane.unmount()
 })
 

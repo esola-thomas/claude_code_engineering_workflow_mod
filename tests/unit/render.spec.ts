@@ -7,6 +7,7 @@ import {
   renderDecisions,
   renderExploration,
   renderHandoff,
+  renderMapHtml,
   renderMapText,
   renderMapView,
   renderPhaseRail,
@@ -740,6 +741,39 @@ describe('the drawn map', () => {
     const broken = makeTask({ system_map: { mermaid: 'graph TD\n A -> B', text_map: '', components: [], updated_at: AT } })
     assert.match(renderMapText(broken, 80, 'f'), /does not parse as a flowchart[^\n]*\n\ngraph TD\n A -> B/)
     assert.match(renderMapText(makeTask(), 80, 'f'), /No system map recorded yet/)
+  })
+
+  it('renderMapHtml is one self-contained page: SVG, evidence per node, links, notes, components and source; no script, no network', () => {
+    const html = renderMapHtml(withMap({ findings: [makeFinding(1), makeFinding(2, { stale: true })], system_map: { mermaid: MAP, text_map: 'a note', components: ['a'], updated_at: AT } }))
+    assert.match(html, /^<!doctype html>\n<html lang="en">/)
+    assert.match(html, /Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"/)
+    assert.doesNotMatch(html, /<script|https?:\/\/(?!www\.w3\.org\/2000\/svg)/)
+    assert.match(html, /<title>System map - TASK-001: Investigate sum\(\)<\/title>/)
+    assert.match(html, /<div class="diagram"><svg /)
+    assert.match(html, /class="node stale"/)
+    assert.match(html, /<td><code>src\/file2\.ts \(helper\)<\/code><\/td><td><span class="stale">stale<\/span><\/td>/)
+    assert.match(html, /<li><code>src\/file1\.ts --calls--&gt; src\/file2\.ts \(helper\)<\/code><\/li>/)
+    assert.match(html, /<h2>Notes<\/h2><ul><li>a note<\/li><\/ul>/)
+    assert.match(html, /<details><summary>Mermaid source/)
+    assert.match(html, /prefers-color-scheme: dark/)
+  })
+
+  it('renderMapHtml escapes every model-written string', () => {
+    const evil = '<script>alert(1)</script>'
+    const html = renderMapHtml(makeTask({
+      title: evil,
+      system_map: { mermaid: `flowchart LR\n  A["a < b"] --> B`, text_map: evil, components: [evil], updated_at: AT },
+    }))
+    assert.doesNotMatch(html, /<script>/)
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/)
+  })
+
+  it('renderMapHtml opens the source when the diagram does not parse, and handles no map', () => {
+    const broken = renderMapHtml(makeTask({ system_map: { mermaid: 'graph TD\n A -> B', text_map: '', components: [], updated_at: AT } }))
+    assert.match(broken, /does not parse as a flowchart/)
+    assert.match(broken, /<details open>/)
+    assert.doesNotMatch(broken, /<svg/)
+    assert.match(renderMapHtml(makeTask()), /No system map recorded yet/)
   })
 
   it('the pane model carries each section as markdown and the map marks', () => {

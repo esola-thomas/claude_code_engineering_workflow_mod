@@ -17,6 +17,7 @@ import {
   renderDecisions,
   renderExploration,
   renderHandoff,
+  renderMapHtml,
   renderMapText,
   renderPlan,
   renderQuestions,
@@ -748,12 +749,20 @@ async function cmdReset(ctx: Ctx): Promise<CommandOutput> {
 }
 
 /** The diagram drawn as text for the terminal (`columns` wide), with the pane switched to its Map section, where desktop surfaces draw it as SVG. */
-async function cmdMap(ctx: Ctx, columns: number): Promise<CommandOutput> {
+async function cmdMap(ctx: Ctx, columns: number, html: boolean): Promise<CommandOutput> {
   const active = await loadActive(ctx)
   if (active === null) return noActiveOutput()
-  const path = joinPath(taskDir(ctx.root, active.task.id), 'system-map.md')
-  return { text: renderMapText(active.task, columns, path), changed: false, openPane: true, section: 'map' }
+  const dir = taskDir(ctx.root, active.task.id)
+  const text = renderMapText(active.task, columns, joinPath(dir, 'system-map.md'))
+  if (!html) return { text, changed: false, openPane: true, section: 'map' }
+  // A view, not workflow state: the page is rewritten on each run and nothing else reads it.
+  const page = joinPath(dir, MAP_HTML_FILE)
+  await ctx.io.writeText(page, renderMapHtml(active.task))
+  return { text: `${text}\nPage: file://${encodeURI(page)} (open it in a browser; it needs no network and runs no script)`, changed: false, openPane: true, section: 'map' }
 }
+
+/** Written by /ewm map --html next to system-map.md. */
+export const MAP_HTML_FILE = 'system-map.html'
 
 async function cmdQuestions(ctx: Ctx): Promise<CommandOutput> {
   const active = await loadActive(ctx)
@@ -956,7 +965,7 @@ async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via, options:
     case 'status':
       return cmdStatus(ctx)
     case 'map':
-      return cmdMap(ctx, options.columns ?? 80)
+      return cmdMap(ctx, options.columns ?? 80, command.html === true)
     case 'questions':
       return cmdQuestions(ctx)
     case 'plan':
