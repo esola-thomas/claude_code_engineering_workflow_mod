@@ -1,6 +1,6 @@
 # ewm: Engineering Workflow Mod for Claude Code
 
-ewm runs one engineering task as a resumable workflow: INTAKE, EXPLORE, UNDERSTAND, PLAN, IMPLEMENT, VALIDATE, DONE. Task state is stored in `.ewm/` in your repository, not in the conversation, so a task survives restarting Claude Code. Research is delegated to read-only subagents on a cheaper model, every finding must cite a file and line range, and two gates need your explicit `/ewm approve`: one before any edit, one before the task is closed. Use it when you want to agree on scope and a plan before code changes, and to see the evidence behind the change afterwards. v0.0.0 handles one active task in one repository.
+ewm runs one engineering task as a resumable workflow: INTAKE, EXPLORE, UNDERSTAND, PLAN, IMPLEMENT, VALIDATE, DONE. Task state is stored in `.ewm/` in your repository, not in the conversation, so a task survives restarting Claude Code. Research is delegated to read-only subagents on a cheaper model, every finding must cite a file and line range, and two gates need your explicit `/ewm approve`: one before any edit, one before the task is closed. Use it when you want to agree on scope and a plan before code changes, and to see the evidence behind the change afterwards. ewm handles one active task in one repository.
 
 ## Install
 
@@ -9,6 +9,8 @@ ewm runs one engineering task as a resumable workflow: INTAKE, EXPLORE, UNDERSTA
 ```
 
 Answer `y` when Claude Code asks to confirm, then choose a scope; user scope makes the plugin available in all your projects. The Desktop Code tab cannot run `/plugin`: install from a terminal at user scope, and the plugin then loads in the Desktop Code tab.
+
+**Updates.** Claude Code does not update plugins from third-party marketplaces on its own. To get a new release, run `claude plugin update ewm@ewm` in a shell (or `/plugin marketplace update ewm` in a session), or turn on updates once: `/plugin` > Marketplaces > ewm > Enable auto-update. To stay on one release, add the marketplace at its tag: `/plugin marketplace add esola-thomas/claude_code_engineering_workflow_mod#v0.0.1`. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -237,8 +239,10 @@ CI (`.github/workflows/ci.yml`) runs the unit tests, validation and engine tests
 
 For a development session, run `claude --plugin-dir .` from the repository root. It loads the working copy of the mod.
 
+Releasing: installed users receive new code only when `version` in `.claude-plugin/plugin.json` changes (Claude Code uses it as the cache key), so a merge alone ships nothing. For a release, set the new version in `.claude-plugin/plugin.json` and `package.json`, move the `[Unreleased]` entries of `CHANGELOG.md` under the new version, merge, then tag the merge commit `v<version>` and publish a GitHub release from the tag. CI validates with `--strict`, which fails when `version` is missing or malformed.
+
 Design documents: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (module contracts), [docs/SPEC-REVIEW.md](docs/SPEC-REVIEW.md) (decisions D1-D22 and fixes F1-F5), [docs/WORKFLOW.md](docs/WORKFLOW.md) (how v0.0.0 was built and its metrics).
 
 ## Status
 
-v0.0.0 is an MVP. It covers one active task in one repository. The live acceptance results for SPEC section 9, criteria AC1 to AC6, are in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Not in v0.0.0: quick and adaptive modes, automatic model escalation, multi-repository and monorepo detection, ticket and CI adapters, and Verdi or UVM introspection. See [docs/SPEC.md](docs/SPEC.md) and [CHANGELOG.md](CHANGELOG.md).
+ewm is an MVP. It covers one active task in one repository. The live acceptance results for SPEC section 9, criteria AC1 to AC6, are in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md). Not in v0.0.0: quick and adaptive modes, automatic model escalation, multi-repository and monorepo detection, ticket and CI adapters, and Verdi or UVM introspection. See [docs/SPEC.md](docs/SPEC.md) and [CHANGELOG.md](CHANGELOG.md).

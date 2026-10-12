@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-10-12
+
 ### Added
 
 - System map drawn without Mermaid: `src/graph.ts` parses a strict subset of Mermaid flowcharts and lays it out (layers, crossing reduction, orthogonal edges). The pane's Map section draws it as SVG (themed for light and dark, node tooltips) in the desktop app, VS Code and mobile, and as box-drawing text sized to the pane in the terminal. Graphs too wide or over 80 nodes fall back to the list of links.
@@ -85,3 +87,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - No gate forces the `ewm:reviewer` diff review before VALIDATE. `handoff.md` records whether it ran (observation 4).
 
 See [docs/SPEC-REVIEW.md](docs/SPEC-REVIEW.md#known-limits-accepted-for-v000) for the full list of accepted limits.
+
+[Unreleased]: https://github.com/esola-thomas/claude_code_engineering_workflow_mod/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/esola-thomas/claude_code_engineering_workflow_mod/releases/tag/v0.0.1
