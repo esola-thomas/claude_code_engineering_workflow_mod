@@ -21,14 +21,14 @@ If these tools are not loaded, load them with ToolSearch query "select:mcp__ewm_
 | mcp__ewm__record_finding | For each new fact you verify while answering. Same evidence rules as EXPLORE (repo-relative existing path, lines in range). | Active task. |
 | mcp__ewm__question | `{action:'add', text}` for a new unknown; `{action:'resolve', id, answer}` when the person or evidence answers one. | Active task. |
 | mcp__ewm__decision | For each decision or assumption the person states or confirms. `{title, choice, rationale}`. | Active task. |
-| mcp__ewm__write_map | When the explanation changes the map. `{mermaid, text_map, components[]}`. | `mermaid` is 1-20000 characters. |
+| mcp__ewm__write_map | When the explanation changes the map. `{mermaid, text_map?, components?}`. | `mermaid` is 1-20000 characters and must parse as a flowchart. |
 | mcp__ewm__set_intake | When the person changes the goal, criteria or constraints. Send the complete lists. | Phase INTAKE through PLAN. |
 | mcp__ewm__advance | `{to:'EXPLORE', reason}` when data is missing. | Phase UNDERSTAND. Moving to PLAN is refused for you: only the person starts planning, with `/ewm plan`. |
 
 ## Steps
 
 1. Call mcp__ewm__status. After a resume, Read `.ewm/tasks/<id>/exploration.md`, `system-map.md` and `questions.md` to reload the evidence. Treat findings marked STALE as unverified until you re-read their lines.
-2. Open with the map: show the Mermaid diagram in a fenced mermaid code block, plus the text map, so the person can see the area.
+2. Open with the map: tell the person the pane's Map section draws it (or `/ewm map` in the terminal), and walk the main path in a few lines of text, naming the components as the diagram does. Do not paste the Mermaid source: the terminal shows it as code.
 3. Explain step by step, from entry point to effect: three to seven steps, each citing `path:lines` and the finding id (F-001). Give one step at a time, then check: "Does this match what you expected?" Go deeper where the person asks (deep dive on request).
 4. Contrast hypotheses. For each: what it predicts, which findings support or refute it, and what observation would tell them apart. Say plainly which is best supported and how sure you are. Optionally ask `ewm:reviewer` to challenge them: give it the hypotheses, the finding evidence and N.
 5. Answer questions from recorded evidence. For a small lookup use Read, Grep or Glob. For a larger one delegate to a scout. Record each new fact with mcp__ewm__record_finding. If you cannot back an answer with evidence, say it is unverified.

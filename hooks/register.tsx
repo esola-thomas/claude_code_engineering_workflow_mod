@@ -6,6 +6,8 @@ import { update } from 'claude-code'
 import type { EngineInterface, PluginState, Register } from 'claude-code'
 
 import { parseCommand } from '../src/args.ts'
+import { adjacencyLines, drawSvg, drawText, parseFlowchart, splitMermaid, undrawnNote } from '../src/graph.ts'
+import type { NodeMark } from '../src/graph.ts'
 import { engineIo } from '../src/io-engine.ts'
 import type { EngineIoSource } from '../src/io-engine.ts'
 import { evaluateToolCall, OWN_TOOL_PREFIX, WRITE_TOOLS } from '../src/policies.ts'
@@ -30,6 +32,7 @@ import { EwmError, unprefixed } from '../src/types.ts'
 import type { CommandOutput } from '../src/types.ts'
 
 type View = PluginState['ewm']['view']
+type Section = PluginState['ewm']['section']
 
 // State references: `plugin` and `key` must be literals for $.state.
 const VIEW = { plugin: 'ewm', key: 'view' } as const
@@ -213,6 +216,10 @@ async function settle($: EngineInterface, ctx: Ctx, out: CommandOutput): Promise
   await safely(() => $.state.set(NOTICE, null))
   if (out.openPane === true) await openPane($)
   queueKickoff($, out.kickoff)
+  if (out.section !== undefined) {
+    const section = out.section
+    await safely(() => $.state.set(SECTION, section))
+  }
   const text = replyText(out.text)
   return out.context === undefined ? { text } : { text, context: out.context }
 }
@@ -250,7 +257,7 @@ export const register: Register = on => {
     if ('name' in parsed && STATE_CHANGING_COMMANDS.includes(parsed.name) && !HUMAN_ORIGINS.includes(e.origin.kind)) {
       return { text: replyText(refusedCommand(parsed.name)) }
     }
-    return settle($, ctx, await runCommand(ctx, e.args, 'command'))
+    return settle($, ctx, await runCommand(ctx, e.args, 'command', { columns: e.presentation.columns }))
   }).catch(() => ({ text: replyText('ewm: the command failed unexpectedly. Run /ewm status to see where the task stands.') }))
 
   // Guard first: hooks registered earlier sit outside later ones, so a denial never reaches the tools below.
@@ -323,9 +330,10 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button, Markdown, Code } = elements
     const view: View = (await $.state.get(VIEW)).value ?? null
-    const section = (await $.state.get(SECTION)).value ?? 'overview'
+    const section: Section = (await $.state.get(SECTION)).value ?? 'overview'
     const notice = (await $.state.get(NOTICE)).value ?? null
 
     if (view === null) {
@@ -337,26 +345,52 @@ export const register: Register = on => {
       )
     }
 
+    // A diagram: SVG where the surface draws vector images, box-drawing text sized to the pane in the terminal,
+    // the links as a list when it does not fit, and the source as code when it does not parse.
+    const columns = Math.max(20, e.props.bodyColumns - 1)
+    const diagram = (source: string, key: string, marks: Readonly<Record<string, NodeMark>>) => {
+      const parsed = parseFlowchart(source)
+      if (!parsed.ok) return <Code key={key} source={source} language="text" />
+      const alt = adjacencyLines(parsed.graph).join('\n') || 'An empty diagram.'
+      // The terminal's table answers Svg with an empty fragment, so the surface decides, not the table.
+      if (e.surface !== 'terminal' && 'Svg' in elements) {
+        const svg = drawSvg(parsed.graph, { marks, title: view.title })
+        if (svg !== null) {
+          const { Svg } = elements
+          return <Svg key={key} source={svg} alt={alt} isInteractive />
+        }
+      }
+      const lines = drawText(parsed.graph, { columns, marks }) ?? [undrawnNote(parsed.graph, columns), ...alt.split('\n').map(line => `  ${line}`)]
+      return (
+        <Box key={key} flexDirection="column">
+          {lines.map((line, i) => (
+            <Text key={`${key}-${i}`} wrap="truncate-end">
+              {line === '' ? ' ' : line}
+            </Text>
+          ))}
+        </Box>
+      )
+    }
+    const doc = (markdown: string, marks: Readonly<Record<string, NodeMark>>) =>
+      splitMermaid(markdown).map((segment, i) =>
+        segment.kind === 'mermaid' ? diagram(segment.source, `diagram-${i}`, marks) : <Markdown key={`doc-${i}`} text={segment.text} />,
+      )
+
     const rail = view.rail.map(stage => (stage.state === 'current' ? `[${stage.label}]` : stage.label)).join(' > ')
     const { counts } = view
-    const lines =
-      section === 'map'
-        ? view.map_lines.length > 0
-          ? view.map_lines
-          : ['No system map yet. The lead records one with mcp__ewm__write_map.']
-        : section === 'questions'
-          ? view.question_lines.length > 0
-            ? view.question_lines
-            : ['No open questions.']
-          : [
-              `${counts.components} components · ${counts.sources} sources · ${counts.findings} findings · ${counts.stale} stale`,
-              `${counts.open_questions} open questions · ${counts.risks} risks`,
-              view.models.length > 0 ? `Models: ${view.models.join(', ')}` : 'Models: none used yet',
-              `Next: ${view.next_action}`,
-            ]
+    const body =
+      section === 'overview'
+        ? [
+            `${counts.components} components · ${counts.sources} sources · ${counts.findings} findings · ${counts.stale} stale`,
+            `${counts.open_questions} open questions · ${counts.risks} risks`,
+            view.models.length > 0 ? `Models: ${view.models.join(', ')}` : 'Models: none used yet',
+            `Next: ${view.next_action}`,
+          ].map((line, i) => <Text key={`overview-${i}`}>{line}</Text>)
+        : doc(view.docs[section], section === 'map' ? view.map_marks : {})
 
     const shownPlan = view.plan
     const approvePlanHash = shownPlan === null || shownPlan === undefined ? undefined : shownPlan.hash
+    const show = (next: Section) => () => update($, SECTION, () => next)
     return (
       <Box flexDirection="column">
         <Text dimColor>Project: {view.project}</Text>
@@ -368,9 +402,7 @@ export const register: Register = on => {
           {view.phase === 'PAUSED' ? ' (paused)' : ''}
         </Text>
         <Box flexDirection="column" marginTop={1}>
-          {lines.map(line => (
-            <Text>{line}</Text>
-          ))}
+          {body}
         </Box>
         {shownPlan != null && (
           <Text>
@@ -384,9 +416,11 @@ export const register: Register = on => {
         )}
         {notice !== null && <Text dimColor>{notice}</Text>}
         <Box gap={1} marginTop={1}>
-          <Button key="overview" label="Overview" hotkey="o" onPress={() => update($, SECTION, () => 'overview' as const)} />
-          <Button key="map" label="Map" hotkey="m" onPress={() => update($, SECTION, () => 'map' as const)} />
-          <Button key="questions" label="Questions" hotkey="q" onPress={() => update($, SECTION, () => 'questions' as const)} />
+          <Button key="overview" label="Overview" hotkey="o" onPress={show('overview')} />
+          <Button key="map" label="Map" hotkey="m" onPress={show('map')} />
+          <Button key="plan" label="Plan" hotkey="p" onPress={show('plan')} />
+          <Button key="questions" label="Questions" hotkey="q" onPress={show('questions')} />
+          <Button key="findings" label="Findings" hotkey="f" onPress={show('findings')} />
           {view.pending_gate !== null && <Button key="approve" label="Approve" hotkey="a" variant="primary" onPress={() => approveFromPane($, approvePlanHash)} />}
         </Box>
       </Box>

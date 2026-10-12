@@ -32,8 +32,8 @@ To stop at any point, run `/ewm pause`. In a new session, `/ewm resume TASK-001`
 | `/ewm new "<title>" [--goal "<text>"]` | Start a task in INTAKE. A running task is paused first. | You |
 | `/ewm resume [TASK-001]` | Continue the given task, else the active one, else the most recently updated open one. Prints a resume brief. | You |
 | `/ewm status` | Phase, counts, models used, pending gate and next action. | Any |
-| `/ewm map` | Show the system map and the file it is in. | Any |
-| `/ewm questions` | Show open and resolved questions. | Any |
+| `/ewm map [--html]` | Draw the system map in the terminal (sized to its width; the links as a list when it does not fit) and switch the pane to Map. `--html` also writes `system-map.html` next to `system-map.md` and prints its `file://` link: one page with the diagram, the evidence each node cites, the links, notes and the Mermaid source. It loads nothing from the network and runs no script. | Any |
+| `/ewm questions` | Show open and resolved questions, and switch the pane to Questions. | Any |
 | `/ewm plan` | In UNDERSTAND, move to PLAN. In PLAN or later, show the plan. In INTAKE or EXPLORE, explain the path to PLAN. | You |
 | `/ewm pause` | Save a checkpoint and leave the workflow. | You |
 | `/ewm reset` | Save the gate ledger to `.ewm/ledger-backup-<time>.json` and start an empty one. Use it when the ledger is reported malformed, or to start over. Tasks on disk are kept; a task you resume afterwards starts at PLAN at most, with no approvals, so you approve its gates again. | You |
@@ -80,7 +80,7 @@ stateDiagram-v2
 - **Gate 1, plan approval (PLAN to IMPLEMENT).** Needs a plan with at least one step and your `/ewm approve`. The approval records the plan's hash. Editing the plan afterwards voids the approval, so you approve again. The gate is skipped when `policies.require_plan_approval` is `false`.
 - **Gate 2, acceptance (VALIDATE to DONE).** Needs your `/ewm approve` and at least one passing `run_validation` run recorded since the task entered VALIDATE. Closing writes `handoff.md` and clears the active task.
 - **Pause and resume.** `/ewm pause` works from any active phase. `/ewm resume` returns the task to the phase it was paused from. If that phase is IMPLEMENT or VALIDATE and the plan has no valid approval, the task resumes in PLAN. After `/ewm reset`, a task the ledger no longer knows resumes at PLAN at most with no approvals; a DONE task is not resumed.
-- **Pane and status line.** The Engineering Workflow pane shows the phase, counts, models, next action and the buttons Overview, Map, Questions and Approve. Approve appears only while a gate waits for you. The status line shows the task, the phase and any pending gate. If the pane is not placed, the text output of each command is the fallback.
+- **Pane and status line.** The Engineering Workflow pane shows the phase, counts, models, next action and the buttons Overview, Map, Plan, Questions, Findings and Approve. Approve appears only while a gate waits for you. Plan, Questions and Findings are drawn as markdown. Map draws the system map: as a diagram (SVG, light or dark) in the desktop app, VS Code and mobile, and as box-drawing text sized to the pane in the terminal. A node whose evidence went stale is outlined in red (heavy box in the terminal), and in the desktop app hovering a node lists the findings that cite it. The status line shows the task, the phase and any pending gate. If the pane is not placed, the text output of each command is the fallback.
 
 ## Configuration
 
@@ -160,7 +160,8 @@ What it does not protect against is listed under "Known limits" in [docs/SPEC-RE
     ├── task.json         task state; the previous copy is kept as task.json.bak
     ├── audit.jsonl       one line per event; rotates to audit.1.jsonl past 1 MiB
     ├── exploration.md    findings with evidence and staleness
-    ├── system-map.md     map, with a Mermaid diagram
+    ├── system-map.md     map: notes, links, components and the Mermaid source
+    ├── system-map.html   written by /ewm map --html: the drawn map as a page
     ├── questions.md
     ├── decisions.md
     ├── plan.md

@@ -91,7 +91,14 @@ describe('parseCommand: simple commands', () => {
     assert.deepEqual(parseCommand('   \n '), { name: 'status' })
   })
 
-  for (const name of ['status', 'map', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const) {
+  it('parses map with and without --html, and refuses anything else after it', () => {
+    assert.deepEqual(parseCommand('map'), { name: 'map' })
+    assert.deepEqual(parseCommand('  map  --html '), { name: 'map', html: true })
+    assertParseError('map extra', 'map takes no arguments except --html')
+    assertParseError('map --html extra', 'map takes no arguments except --html')
+  })
+
+  for (const name of ['status', 'questions', 'plan', 'pause', 'reset', 'list', 'help'] as const) {
     it(`parses ${name}`, () => {
       assert.deepEqual(parseCommand(name), { name })
       assert.deepEqual(parseCommand(`  ${name}  `), { name })

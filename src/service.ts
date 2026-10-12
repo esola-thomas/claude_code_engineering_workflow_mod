@@ -9,6 +9,7 @@
 import { parseCommand, splitArgs, USAGE } from './args.ts'
 import type { EwmCommand } from './args.ts'
 import { checkTransition, defaultNextAction, hasValidApproval, pause, pendingGate, planHash, recordApproval, resume, transition } from './controller.ts'
+import { formatParseErrors, parseFlowchart } from './graph.ts'
 import { classifyBash } from './policies.ts'
 import { DEFAULT_PROFILE, loadProfile } from './profile.ts'
 import {
@@ -16,6 +17,8 @@ import {
   renderDecisions,
   renderExploration,
   renderHandoff,
+  renderMapHtml,
+  renderMapText,
   renderPlan,
   renderQuestions,
   renderResumeBrief,
@@ -745,17 +748,26 @@ async function cmdReset(ctx: Ctx): Promise<CommandOutput> {
   }
 }
 
-async function cmdMap(ctx: Ctx): Promise<CommandOutput> {
+/** The diagram drawn as text for the terminal (`columns` wide), with the pane switched to its Map section, where desktop surfaces draw it as SVG. */
+async function cmdMap(ctx: Ctx, columns: number, html: boolean): Promise<CommandOutput> {
   const active = await loadActive(ctx)
   if (active === null) return noActiveOutput()
-  const path = joinPath(taskDir(ctx.root, active.task.id), 'system-map.md')
-  return { text: `${renderSystemMap(active.task).trimEnd()}\n\nFile: ${path}`, changed: false }
+  const dir = taskDir(ctx.root, active.task.id)
+  const text = renderMapText(active.task, columns, joinPath(dir, 'system-map.md'))
+  if (!html) return { text, changed: false, openPane: true, section: 'map' }
+  // A view, not workflow state: the page is rewritten on each run and nothing else reads it.
+  const page = joinPath(dir, MAP_HTML_FILE)
+  await ctx.io.writeText(page, renderMapHtml(active.task))
+  return { text: `${text}\nPage: file://${encodeURI(page)} (open it in a browser; it needs no network and runs no script)`, changed: false, openPane: true, section: 'map' }
 }
+
+/** Written by /ewm map --html next to system-map.md. */
+export const MAP_HTML_FILE = 'system-map.html'
 
 async function cmdQuestions(ctx: Ctx): Promise<CommandOutput> {
   const active = await loadActive(ctx)
   if (active === null) return noActiveOutput()
-  return { text: renderQuestions(active.task), changed: false }
+  return { text: renderQuestions(active.task), changed: false, openPane: true, section: 'questions' }
 }
 
 async function cmdPlan(ctx: Ctx): Promise<CommandOutput> {
@@ -941,7 +953,10 @@ async function cmdList(ctx: Ctx): Promise<CommandOutput> {
   return { text: list + note, changed: dangling }
 }
 
-async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via): Promise<CommandOutput> {
+/** Where the command's text is shown: the terminal width (80 when unknown). */
+export type CommandOptions = { columns?: number }
+
+async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via, options: CommandOptions): Promise<CommandOutput> {
   switch (command.name) {
     case 'new':
       return cmdNew(ctx, command)
@@ -950,7 +965,7 @@ async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via): Promise
     case 'status':
       return cmdStatus(ctx)
     case 'map':
-      return cmdMap(ctx)
+      return cmdMap(ctx, options.columns ?? 80, command.html === true)
     case 'questions':
       return cmdQuestions(ctx)
     case 'plan':
@@ -971,12 +986,12 @@ async function dispatchCommand(ctx: Ctx, command: EwmCommand, via: Via): Promise
 }
 
 /** Parses and runs one /ewm command. `via` is 'pane' when invoked from a pane button. Never throws: EwmError becomes { text: message, changed: false }. */
-export async function runCommand(ctx: Ctx, args: string, via: 'command' | 'pane'): Promise<CommandOutput> {
+export async function runCommand(ctx: Ctx, args: string, via: 'command' | 'pane', options: CommandOptions = {}): Promise<CommandOutput> {
   return withLock(async () => {
     try {
       const command = parseCommand(args)
       if ('error' in command) return { text: command.error, changed: false }
-      return await dispatchCommand(ctx, command, via)
+      return await dispatchCommand(ctx, command, via, options)
     } catch (error) {
       return { text: errorText(error), changed: false }
     }
@@ -1320,15 +1335,28 @@ async function toolWriteMap(ctx: Ctx, active: Active, input: Input, at: string):
   const tool = 'write_map'
   const { task } = active
   const mermaid = requireString(tool, input, 'mermaid', 20000)
-  const textMap = requireString(tool, input, 'text_map', 20000)
-  const components = stringList(tool, input, 'components', 0, 100, 200)
+  const parsed = parseFlowchart(mermaid)
+  if (!parsed.ok) {
+    throw invalid(
+      `${tool}: the Mermaid source does not parse (${formatParseErrors(parsed.errors)}). ` +
+        'Write a flowchart: "flowchart LR" on the first line, then one edge per line, e.g. A["src/a.ts"] -->|calls| B["src/b.ts"].',
+    )
+  }
+  const { graph } = parsed
+  const textMap = input.text_map === undefined || input.text_map === '' ? '' : requireString(tool, input, 'text_map', 20000)
+  const listed = stringList(tool, input, 'components', 0, 100, 200)
+  // Without a list, the components are the diagram's own nodes.
+  const components = listed.length > 0 ? listed : graph.nodes.slice(0, 100).map(node => node.label.slice(0, 200))
   const system_map = { mermaid, text_map: textMap, components, updated_at: at }
   await persist(ctx, active, { ...task, system_map, updated_at: at }, {
     at,
     artifacts: ['system-map.md'],
-    audit: [effect(tool, `system map saved: ${components.length} component(s)`)],
+    audit: [effect(tool, `system map saved: ${graph.nodes.length} node(s), ${graph.edges.length} edge(s), ${components.length} component(s)`)],
   })
-  return done(`System map saved with ${components.length} component(s) to ${EWM_DIR}/tasks/${task.id}/system-map.md.`)
+  return done(
+    `System map saved: ${graph.nodes.length} node(s), ${graph.edges.length} edge(s), ${components.length} component(s), to ${EWM_DIR}/tasks/${task.id}/system-map.md. ` +
+      'The pane draws it (Map), and /ewm map draws it in the terminal.',
+  )
 }
 
 // -- run_validation ----------------------------------------------------------
@@ -1617,16 +1645,22 @@ export const TOOL_SPECS: readonly { name: string; description: string; inputSche
   {
     name: 'write_map',
     description:
-      'Saves the system map: a Mermaid diagram, a plain-text map and the component names. Call it in EXPLORE or UNDERSTAND once you can explain how the parts fit, and again when the understanding changes. ' +
-      'Writes system-map.md (the diagram is not rendered in the pane; the text map is).',
+      'Saves the system map: a Mermaid flowchart, optional notes and the component names. Call it in EXPLORE or UNDERSTAND once you can explain how the parts fit, and again when the understanding changes. ' +
+      'The source is parsed: a syntax error is refused with its line and column. The pane draws the diagram (as SVG on desktop, as text in the terminal) and /ewm map draws it in the terminal; system-map.md keeps the source.',
     inputSchema: {
       type: 'object',
       properties: {
-        mermaid: { type: 'string', minLength: 1, maxLength: 20000, description: 'Mermaid source without the code fence, e.g. "flowchart LR\\n  A --> B".' },
-        text_map: { type: 'string', description: 'The same map as plain text, one line per relationship or component.' },
-        components: stringArray('Names of the components on the map.'),
+        mermaid: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 20000,
+          description:
+            'Mermaid flowchart source without the code fence, e.g. "flowchart LR\\n  A[\\"src/a.ts\\"] -->|calls| B[\\"src/b.ts\\"]". Supported: flowchart/graph with TD, TB, BT, LR or RL; node shapes [] () ([]) [[]] [()] (()) {} {{}}; edges --> --- -.-> ==> with |label|; A & B --> C; subgraph ... end.',
+        },
+        text_map: { type: 'string', description: 'Optional notes shown under the diagram, one short line each (what the arrows cannot say).' },
+        components: stringArray('Names of the components on the map; defaults to the diagram\'s node labels.'),
       },
-      required: ['mermaid', 'text_map', 'components'],
+      required: ['mermaid'],
       additionalProperties: false,
     },
   },
