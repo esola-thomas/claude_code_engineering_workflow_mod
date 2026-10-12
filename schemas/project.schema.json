@@ -58,6 +58,30 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Third-party MCP tool names allowed while a task is active: exact names, or a prefix ending in '*'."
+        },
+        "allowed_commands": {
+          "type": "object",
+          "description": "Commands the guard lets through beyond its own rules while a task is active. Each entry is a prefix of plain words: a program and at least one subcommand, such as \"gh issue list\" or \"git push\". A command matches when it is one simple command with no pipe, redirection, expansion, glob, assignment or wrapper (env, sh -c, xargs, ...) whose first words are the entry's words; the words after the prefix are free. Entries for commands that use the network apply only with external_network: allow. git push with --force, -f, --force-with-lease, --delete, -d, --mirror, --prune, a +refspec or a :ref, and gh api with a write method, never run. The read-only agents (ewm:repo-scout, ewm:docs-scout, ewm:reviewer) never get these.",
+          "properties": {
+            "read_only": {
+              "default": [],
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowed in every active phase, as if read-only."
+            },
+            "implement": {
+              "default": [],
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowed in IMPLEMENT, overriding the destructive class (for example git push)."
+            },
+            "validate": {
+              "default": [],
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowed in VALIDATE (for example gh pr create)."
+            }
+          }
         }
       }
     },

@@ -979,8 +979,10 @@ function inspectGit(args: readonly string[], depth: number, facts: Facts, hops =
       inspectSource(after.slice(first).join(' '), depth + 1, facts)
     }
   }
-  if (sub === 'push') facts.destructive = true
-  else if (sub === 'reset' && rest.some((arg) => isLongOption(arg, 'hard'))) facts.destructive = true
+  if (sub === 'push') {
+    facts.destructive = true
+    facts.network = true // decides whether a policies.allowed_commands entry needs external_network: allow
+  } else if (sub === 'reset' && rest.some((arg) => isLongOption(arg, 'hard'))) facts.destructive = true
   else if (sub === 'clean' && rest.some((arg) => /[fdxX]/.test(shortCluster(arg)) || isLongOption(arg, 'force'))) facts.destructive = true
   else if ((sub === 'checkout' || sub === 'restore') && rest.some((arg) => WHOLE_TREE_PATHSPECS.has(arg))) facts.destructive = true
   else if (NETWORK_GIT_SUBCOMMANDS.has(sub)) facts.network = true
@@ -1179,17 +1181,165 @@ function matchesValidationCommand(command: string, profile: Profile): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Allowed commands (policies.allowed_commands)
+//
+// An entry is a prefix of plain words: the program and its subcommands (`gh issue list`,
+// `git push`). It matches a command that is one simple command, written without a
+// wrapper, assignment, expansion, redirection or glob, whose first words are the entry's
+// words. The words after the prefix are free, except for the forms in isNeverAllowed.
+// ---------------------------------------------------------------------------
+
+export const ALLOWED_COMMAND_LISTS = ['read_only', 'implement', 'validate'] as const
+export type AllowedCommandList = (typeof ALLOWED_COMMAND_LISTS)[number]
+
+const ALLOWED_PROGRAM_WORD = /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/
+const ALLOWED_WORD = /^[A-Za-z0-9_.:@/=+,-]+$/
+/** Programs that run other commands from their arguments: a prefix of them would open every command. */
+const NEVER_ALLOWED_PROGRAMS = new Set([...SHELLS, ...WRAPPERS.keys(), 'eval', 'sudo', 'doas'])
+const GIT_PUSH_FORBIDDEN_LONG = ['force', 'delete', 'mirror', 'prune']
+const GH_API_FIELD_LONG = ['field', 'raw-field', 'input']
+
+/** The words of an entry, or why it can never match. */
+function parseAllowedCommand(entry: string): { words: string[] } | { problem: string } {
+  const words = splitWords(entry)
+  const program = at(words, 0)
+  if (words.length < 2) return { problem: 'it must name a program and at least one subcommand, such as "gh issue list"' }
+  if (!ALLOWED_PROGRAM_WORD.test(program)) return { problem: 'the program must be a bare name (no path, quotes or shell syntax)' }
+  if (NEVER_ALLOWED_PROGRAMS.has(program)) return { problem: `${program} runs other commands, so it cannot be allowed by prefix` }
+  if (at(words, 1).startsWith('-')) return { problem: 'the second word must be a subcommand, not an option' }
+  if (!words.every((word) => ALLOWED_WORD.test(word))) return { problem: 'it may hold only plain words (no quotes, globs or shell syntax)' }
+  return { words }
+}
+
+/** The value of a short or long option at args[i] (`-XPOST`, `-X POST`, `--method=POST`, `--method POST`). */
+function optionValue(args: readonly string[], i: number, short: string): string {
+  const arg = at(args, i)
+  if (arg.startsWith('--')) {
+    const equals = arg.indexOf('=')
+    return equals < 0 ? at(args, i + 1) : arg.slice(equals + 1)
+  }
+  return arg.length > short.length ? arg.slice(short.length) : at(args, i + 1)
+}
+
+/** `gh api` sends a write request: an explicit method other than GET, or fields without an explicit method (gh then sends POST). */
+function isGhApiWrite(args: readonly string[]): boolean {
+  let method: string | null = null
+  let fields = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = at(args, i)
+    if (arg.startsWith('-X') || isLongOption(arg, 'method')) method = optionValue(args, i, '-X').toUpperCase()
+    else if (/[fF]/.test(shortCluster(arg)) || GH_API_FIELD_LONG.some((name) => isLongOption(arg, name))) fields = true
+  }
+  return (method ?? (fields ? 'POST' : 'GET')) !== 'GET'
+}
+
+/** `git push` that rewrites or deletes remote refs: force, delete, mirror, prune, a `+refspec` or a `:ref` deletion. */
+function isUnsafePush(args: readonly string[]): boolean {
+  return args.some((arg) => {
+    if (arg.startsWith('--')) return GIT_PUSH_FORBIDDEN_LONG.some((name) => isLongOption(arg, name))
+    if (arg.startsWith('-') && arg !== '-') return /[fd]/.test(shortCluster(arg))
+    return arg.startsWith('+') || arg.startsWith(':')
+  })
+}
+
+/** Forms no entry can allow, whatever the profile lists. */
+function isNeverAllowed(words: readonly string[]): boolean {
+  const program = at(words, 0)
+  const args = words.slice(1)
+  if (program === 'git') {
+    const { sub, rest } = parseGit(args)
+    if (rest.some((arg) => isUnsafeGitOption(arg) || isLongOption(arg, 'receive-pack'))) return true
+    return sub === 'push' && isUnsafePush(rest)
+  }
+  if (program === 'gh' && at(args, 0) === 'api') return isGhApiWrite(args.slice(1))
+  return false
+}
+
+/** The lists whose entries match the command. Empty unless the command is one plain simple command (see above). */
+function matchAllowedCommand(scan: Scan, facts: Facts, profile: Profile): AllowedCommandList[] {
+  // Optional: a profile snapshot saved before this key existed has no allowed_commands.
+  const lists = (profile.policies as Partial<Profile['policies']>).allowed_commands
+  if (lists === undefined) return []
+  const words = scan.segments[0]
+  if (scan.segments.length !== 1 || words === undefined || scan.opaque || scan.globWords.length > 0 || scan.heredocLines.length > 0) return []
+  if (facts.mentionsEwm || isNeverAllowed(words)) return []
+  return ALLOWED_COMMAND_LISTS.filter((list) =>
+    (lists[list] ?? []).some((entry) => {
+      const parsed = parseAllowedCommand(entry)
+      return 'words' in parsed && parsed.words.length <= words.length && parsed.words.every((word, i) => word === words[i])
+    }),
+  )
+}
+
+function listCoversPhase(list: AllowedCommandList, phase: Phase): boolean {
+  return list === 'read_only' || (list === 'implement' && phase === 'IMPLEMENT') || (list === 'validate' && phase === 'VALIDATE')
+}
+
+/** read_only entries run "as if read-only": they never lift the destructive rule, which only implement and validate entries do. */
+function listGrants(list: AllowedCommandList, phase: Phase, command: BashAnalysis): boolean {
+  return listCoversPhase(list, phase) && !(list === 'read_only' && command.cls === 'destructive')
+}
+
+/** Warnings for policies.allowed_commands entries that can never match, or need external_network: allow to apply. */
+export function allowedCommandWarnings(profile: Profile): string[] {
+  const lists = (profile.policies as Partial<Profile['policies']>).allowed_commands
+  if (lists === undefined) return []
+  const warnings: string[] = []
+  for (const list of ALLOWED_COMMAND_LISTS) {
+    for (const entry of lists[list] ?? []) {
+      const label = `policies.allowed_commands.${list} entry "${entry}"`
+      const parsed = parseAllowedCommand(entry)
+      if ('problem' in parsed) {
+        warnings.push(`${label} is ignored: ${parsed.problem}.`)
+        continue
+      }
+      if (isNeverAllowed(parsed.words)) {
+        warnings.push(`${label} is ignored: it is a form that never runs during a task (force or delete push, gh api write).`)
+        continue
+      }
+      const facts: Facts = { destructive: false, network: false, mentionsEwm: false }
+      inspectSegment(parsed.words, 0, facts)
+      if (facts.destructive && list === 'read_only') {
+        warnings.push(`${label} is ignored: it is destructive, so list it under implement or validate instead.`)
+        continue
+      }
+      if (facts.network && profile.policies.external_network !== 'allow') {
+        warnings.push(`${label} uses the network and applies only with policies.external_network: allow.`)
+      }
+    }
+  }
+  return warnings
+}
+
+/** One line per non-empty list, for /ewm status. */
+export function describeAllowedCommands(profile: Profile): string[] {
+  const lists = (profile.policies as Partial<Profile['policies']>).allowed_commands
+  if (lists === undefined) return []
+  return ALLOWED_COMMAND_LISTS.filter((list) => (lists[list] ?? []).length > 0).map(
+    (list) => `${list}: ${(lists[list] ?? []).join(', ')}`,
+  )
+}
+
+// ---------------------------------------------------------------------------
 // classifyBash
 // ---------------------------------------------------------------------------
 
 export type BashClass = 'read_only' | 'validation' | 'destructive' | 'network' | 'other'
 
-type BashAnalysis = { cls: BashClass; mentionsEwm: boolean }
+type BashAnalysis = {
+  cls: BashClass
+  mentionsEwm: boolean
+  /** The command (or something in it) talks to the network. */
+  network: boolean
+  /** The policies.allowed_commands lists that match the command. */
+  allowedBy: AllowedCommandList[]
+}
 
 function analyzeBash(command: string, profile: Profile): BashAnalysis {
   const facts: Facts = { destructive: false, network: false, mentionsEwm: mentionsEwmText(command) }
   const scan = inspectSource(command, 0, facts)
-  const result = (cls: BashClass): BashAnalysis => ({ cls, mentionsEwm: facts.mentionsEwm })
+  const allowedBy = scan === null ? [] : matchAllowedCommand(scan, facts, profile)
+  const result = (cls: BashClass): BashAnalysis => ({ cls, mentionsEwm: facts.mentionsEwm, network: facts.network, allowedBy })
   if (scan === null) return result('other')
   if (facts.destructive) return result('destructive')
   if (facts.network) return result('network')
@@ -1296,9 +1446,20 @@ function describeWriteDenial(tool: string, phase: Phase, allowWriteInExplore: bo
   return `ewm: ${tool} is denied in ${phase} (rule: repository writes happen only in IMPLEMENT). Get the plan approved (ask the person to run /ewm approve), or ${PAUSE_HINT}.`
 }
 
+/** Why a command the profile lists did not run here: the lists it is in cover other phases. Empty when it is not listed. */
+function allowanceNote(command: BashAnalysis, phase: Phase, networkOk: boolean): string {
+  if (command.allowedBy.length === 0) return ''
+  const lists = command.allowedBy.map((list) => `policies.allowed_commands.${list}`).join(' and ')
+  if (!networkOk) return ` It is listed in ${lists}, but it uses the network and policies.external_network is deny_by_default.`
+  if (command.cls === 'destructive' && command.allowedBy.every((list) => list === 'read_only')) {
+    return ` It is listed in ${lists}, which never allows a destructive command; list it under policies.allowed_commands.implement or .validate.`
+  }
+  return ` It is listed in ${lists}, which does not cover ${phase}.`
+}
+
 /** The verdict for one tool call. Matrix (first match wins):
  *  1 inert (no task, PAUSED, DONE); 2 read-only agents; 3 own tools; 4 always-denied tools; 5 the /ewm skill;
- *  6 writes to .ewm/; 7 Bash/Monitor (destructive, network, .ewm); 8 outbound and third-party MCP tools;
+ *  6 writes to .ewm/; 7 Bash/Monitor (policies.allowed_commands entries for the phase, then destructive, network, .ewm); 8 outbound and third-party MCP tools;
  *  9 IMPLEMENT allows the rest; 10 the other phases allow only SAFE_TOOLS, NETWORK_READ_TOOLS under external_network: allow,
  *  listed MCP tools and read-only commands. */
 export function evaluateToolCall(ctx: PolicyContext, call: PolicyCall): ToolVerdict {
@@ -1350,9 +1511,13 @@ export function evaluateToolCall(ctx: PolicyContext, call: PolicyCall): ToolVerd
         `ewm: Monitor with ws opens a network connection and is denied in ${phase} (rule: Monitor is classified like Bash and websockets are outbound). Use a read-only command instead, or ${PAUSE_HINT}.`,
       )
     }
+    // Issue #3: a command the profile lists in policies.allowed_commands for this phase runs (network ones need external_network: allow).
+    const networkOk = !command.network || profile.policies.external_network === 'allow'
+    if (networkOk && command.allowedBy.some((list) => listGrants(list, phase, command))) return allow()
+    const listed = allowanceNote(command, phase, networkOk)
     if (command.cls === 'destructive') {
       return deny(
-        `ewm: ${tool} command is destructive and denied in ${phase} (rule: git push, git reset --hard, git clean, git checkout ., rm -rf, find -delete, sudo and similar never run during a task). Ask the person to run it themselves, or ${PAUSE_HINT}.`,
+        `ewm: ${tool} command is destructive and denied in ${phase} (rule: git push, git reset --hard, git clean, git checkout ., rm -rf, find -delete, sudo and similar never run during a task unless policies.allowed_commands lists them; force or delete pushes never run).${listed} Ask the person to run it themselves, or ${PAUSE_HINT}.`,
       )
     }
     if (command.cls === 'network' && profile.policies.external_network !== 'allow') {
@@ -1404,8 +1569,9 @@ export function evaluateToolCall(ctx: PolicyContext, call: PolicyCall): ToolVerd
     if (command.cls === 'read_only' || (phase === 'VALIDATE' && command.cls === 'validation')) return allow()
     const validateHint =
       phase === 'VALIDATE' ? " Run the profile's validation commands with mcp__ewm__run_validation." : ''
+    const listed = allowanceNote(command, phase, true)
     return deny(
-      `ewm: ${tool} command is not read-only and is denied in ${phase} (rule: only read-only commands run before IMPLEMENT).${validateHint} Use Read, Grep or Glob, a read-only command (ls, cat, rg, git status/log/diff; quote globs such as '*.ts'), or ${PAUSE_HINT}.`,
+      `ewm: ${tool} command is not read-only and is denied in ${phase} (rule: only read-only commands and policies.allowed_commands entries run before IMPLEMENT).${validateHint}${listed} Use Read, Grep or Glob, a read-only command (ls, cat, rg, git status/log/diff; quote globs such as '*.ts'), or ${PAUSE_HINT}.`,
     )
   }
   return deny(

@@ -310,7 +310,7 @@ describe('normalizeProfile', () => {
         models: { lead: 'sonnet', search: 'haiku', reviewer: 'sonnet' },
         budgets: { max_parallel_researchers: 3, max_research_rounds_without_user_update: 2, max_findings_per_scout: 5 },
         validation: { commands: ['npm test', 'npm run lint'], timeout_ms: 300000 },
-        policies: { external_network: 'deny_by_default', require_plan_approval: true, allow_write_in_explore: false, allowed_mcp_tools: ['mcp__docs__*'] },
+        policies: { external_network: 'deny_by_default', require_plan_approval: true, allow_write_in_explore: false, allowed_mcp_tools: ['mcp__docs__*'], allowed_commands: { read_only: [], implement: [], validate: [] } },
       }),
     )
   })

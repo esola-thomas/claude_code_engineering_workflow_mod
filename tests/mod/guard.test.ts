@@ -184,3 +184,36 @@ test('D7: read-only subagents cannot write or record, even in IMPLEMENT', async 
   expect((await h.callAs('unknown', EDIT)).deny).toBeUndefined()
   expect((await $.tool.call(EDIT)).deny).toBeUndefined()
 })
+
+test('issue #3: policies.allowed_commands lets listed gh and git commands through, in their phases only', async ($, on) => {
+  const h = createHarness($, on)
+  await h.start()
+  await h.io.writeText(
+    `${ROOT}/.ewm/project.yaml`,
+    [
+      'policies:',
+      '  external_network: allow',
+      '  allowed_commands:',
+      '    read_only: ["gh issue list", "git fetch"]',
+      '    implement: ["git push"]',
+    ].join('\n'),
+  )
+  const started = await h.ewm('new "Triage issues"')
+  expect(started.text).toContain('Allowed commands: read_only: gh issue list, git fetch; implement: git push')
+  await h.advanceTo('EXPLORE')
+  h.reached.length = 0
+
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh issue list --repo owner/name --state open' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'git fetch origin' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh issue close 1' })).deny).toContain('ewm:')
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push -u origin feat/x' })).deny).toContain('allowed_commands.implement')
+  expect(h.reached).toEqual(['Bash', 'Bash'])
+
+  await h.advanceTo('UNDERSTAND', 'PLAN')
+  await h.tool('set_plan', { summary: 's', steps: [{ text: 'fix', files: ['src/a.ts'] }], risks: [], tests: [], alternatives: [] })
+  await h.ewm('approve')
+  expect(h.task().phase).toBe('IMPLEMENT')
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push -u origin feat/x' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push --force origin feat/x' })).deny).toContain('destructive')
+  expect((await $.tool.call({ tool: 'Bash', command: 'git push origin +main' })).deny).toContain('destructive')
+})

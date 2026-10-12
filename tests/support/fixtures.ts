@@ -17,6 +17,7 @@ export function makeProfile(overrides: Partial<Profile> = {}): Profile {
       require_plan_approval: true,
       allow_write_in_explore: false,
       allowed_mcp_tools: [],
+      allowed_commands: { read_only: [], implement: [], validate: [] },
     },
     models: { lead: 'opus', search: 'haiku', reviewer: 'sonnet' },
     budgets: { max_parallel_researchers: 3, max_research_rounds_without_user_update: 2, max_findings_per_scout: 8 },

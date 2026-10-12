@@ -45,6 +45,13 @@ export type Profile = {
     allow_write_in_explore: boolean
     /** Third-party MCP tool names (exact, or prefix ending in `*`) allowed while a task is active under deny_by_default. */
     allowed_mcp_tools: string[]
+    /** Command prefixes (program plus subcommands, e.g. "gh issue list") the guard lets through beyond its own rules:
+     *  read_only in every active phase, implement in IMPLEMENT, validate in VALIDATE. Network ones need external_network: allow. */
+    allowed_commands: {
+      read_only: string[]
+      implement: string[]
+      validate: string[]
+    }
   }
   models: {
     lead: string

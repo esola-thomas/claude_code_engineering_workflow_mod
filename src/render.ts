@@ -6,6 +6,7 @@
 // Output is shown in terminals and in markdown viewers, so structure uses plain
 // ASCII ('>', '-', '#'): no emoji and no ANSI codes.
 
+import { describeAllowedCommands } from './policies.ts'
 import type { ActivePhase, Approval, Evidence, Finding, GateName, PaneModel, Phase, Profile, Question, Staleness, Task, TaskSummary, ValidationRun } from './types.ts'
 
 /** Computed by the caller (service): pendingGate/hasValidApproval on the trusted task, and summarizeModels(task.agent_usage).
@@ -219,6 +220,7 @@ export function renderStatus(task: Task | null, profile: Profile, gate: GateStat
   const pane = paneModel(task, profile, gate)
   const { counts } = pane
   const phase = task.phase === 'PAUSED' && task.paused_from !== null ? `PAUSED (from ${task.paused_from})` : task.phase
+  const allowed = describeAllowedCommands(profile)
   return [
     `Project: ${pane.project}`,
     `Task: ${task.id} - ${oneLine(task.title)}`,
@@ -226,6 +228,7 @@ export function renderStatus(task: Task | null, profile: Profile, gate: GateStat
     `Stage: ${railText(pane.rail, task.phase)}`,
     `Components: ${counts.components} | Sources: ${counts.sources} | Open questions: ${counts.open_questions} | Risks: ${counts.risks} | Findings: ${counts.findings} | Stale: ${counts.stale}`,
     ...modelLines(pane.models),
+    ...(allowed.length === 0 ? [] : [`Allowed commands: ${oneLine(allowed.join('; '))}`]),
     gateLine(gate),
     `Next: ${oneLine(nextActionOf(task, gate))}`,
   ].join('\n')

@@ -30,6 +30,17 @@ policies:
   allowed_mcp_tools:
     - mcp__github__issue_read
     - mcp__github__pull_request_read
+  # Commands the guard lets through beyond its own rules, as a prefix of program plus
+  # subcommands. A command matches when it is one plain command (no pipes, redirects,
+  # variables, globs or wrappers such as env or sh -c) that starts with an entry's words.
+  # Commands that use the network (gh, git fetch, git push) apply only with
+  # external_network: allow; until then these entries are reported at load and do nothing.
+  # Force and delete pushes and gh api write requests never run. Read-only agents
+  # never get these. Defaults: empty lists.
+  allowed_commands:
+    read_only: ["gh issue view", "gh pr view", "git fetch"]   # every active phase
+    implement: ["git push"]                                     # IMPLEMENT only
+    validate: ["gh pr create"]                                  # VALIDATE only
 
 models:
   lead: opus                    # lead role; recorded, not routed in v0.0.0
