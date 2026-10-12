@@ -1,6 +1,6 @@
 {
   "name": "ewm-claude-code-mod",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Engineering Workflow Mod (ewm) for Claude Code",
   "type": "module",

@@ -1,4 +1,4 @@
-# Architecture and module contracts (v0.0.0)
+# Architecture and module contracts (v0.0.1)
 
 This is the build contract. Every module's exported API is fixed here; workers
 implement against it and may add internal helpers but must not change exported

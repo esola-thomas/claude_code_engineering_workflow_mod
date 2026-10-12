@@ -24,7 +24,7 @@ jobs:
       - name: Unit tests
         run: npm run test:unit
       - name: Plugin validation
-        run: claude plugin validate .
+        run: claude plugin validate --strict .
       - name: Engine tests
         run: claude plugin test .
       # Typecheck needs the engine's generated declarations, which are not
