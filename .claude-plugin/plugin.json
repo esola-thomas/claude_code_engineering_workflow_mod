@@ -4,6 +4,5 @@
   "description": "Engineering Workflow Mod: a resumable, gated explore -> understand -> plan -> implement -> validate workflow with evidence, cheap-model scouts and a native pane.",
   "author": { "name": "esola-thomas" },
   "repository": "https://github.com/esola-thomas/claude_code_engineering_workflow_mod",
-  "keywords": ["workflow", "engineering", "subagents", "mod", "evidence"],
-  "types": "./types/index.d.ts"
+  "keywords": ["workflow", "engineering", "subagents", "mod", "evidence"]
 }
